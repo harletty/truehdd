@@ -720,10 +720,7 @@ impl DecoderState {
                         let mask = !((1 << quantiser_step_size[dest]) - 1);
                         let terms = MatrixTerms::new(&ss_state.m_coeff[pmi][..matrix_terms], &[]);
 
-                        by_term_count!(
-                            terms,
-                            apply_matrix(&terms, rows, bypassed_lsb, pmi, dest, mask, |_, _| 0)
-                        );
+                        apply_steady_matrix(&terms, rows, bypassed_lsb, pmi, dest, mask, None);
                     }
                 }
                 0x31EB => {
@@ -742,34 +739,15 @@ impl DecoderState {
                         let dest = matrix_ch[pmi] as usize;
                         let mask = !((1 << quantiser_step_size[dest]) - 1);
                         let terms = MatrixTerms::new(&ss_state.m_coeff[pmi][..matrix_terms], &[]);
-                        let dither_scale = dither_scale[pmi] as i64;
+                        let dither = Dither::new(
+                            dither_table,
+                            dither_index_mask,
+                            primitive_matrices - pmi,
+                            decoded_sample_len,
+                            dither_scale[pmi],
+                        );
 
-                        if dither_scale != 0 {
-                            let step = primitive_matrices - pmi;
-                            by_term_count!(
-                                terms,
-                                apply_matrix(
-                                    &terms,
-                                    rows,
-                                    bypassed_lsb,
-                                    pmi,
-                                    dest,
-                                    mask,
-                                    |blki, _| {
-                                        let blki_abs = blki + decoded_sample_len;
-                                        let dither_index = step * (2 * blki_abs + 1) + blki_abs;
-
-                                        (dither_table[dither_index & dither_index_mask] as i64)
-                                            << (11 + dither_scale)
-                                    }
-                                )
-                            );
-                        } else {
-                            by_term_count!(
-                                terms,
-                                apply_matrix(&terms, rows, bypassed_lsb, pmi, dest, mask, |_, _| 0)
-                            );
-                        }
+                        apply_steady_matrix(&terms, rows, bypassed_lsb, pmi, dest, mask, dither);
                     }
                 }
                 0x31EC => {
@@ -792,8 +770,29 @@ impl DecoderState {
                             &ss_state.m_coeff[pmi][..matrix_terms],
                             &ss_state.delta_cf[pmi][..matrix_terms],
                         );
-                        let dither_scale = dither_scale[pmi] as u64;
-                        let step = primitive_matrices - pmi;
+                        let dither = Dither::new(
+                            dither_table,
+                            dither_index_mask,
+                            primitive_matrices - pmi,
+                            decoded_sample_len,
+                            dither_scale[pmi],
+                        );
+
+                        // Most matrices hold still over the access unit: without a
+                        // delta there is nothing to interpolate, and no second
+                        // product to take of every sample.
+                        if !terms.has_delta() {
+                            apply_steady_matrix(
+                                &terms,
+                                rows,
+                                bypassed_lsb,
+                                pmi,
+                                dest,
+                                mask,
+                                dither,
+                            );
+                            continue;
+                        }
 
                         by_term_count!(
                             terms,
@@ -805,20 +804,10 @@ impl DecoderState {
                                 dest,
                                 mask,
                                 |blki, acc_delta| {
-                                    let blki_abs = blki + decoded_sample_len;
-                                    let mut acc = 0;
+                                    let blki_abs = (blki + decoded_sample_len) as i64;
 
-                                    if dither_scale != 0 {
-                                        let dither_index = step * (2 * blki_abs + 1) + blki_abs;
-
-                                        acc += (dither_table[dither_index & dither_index_mask]
-                                            as i64)
-                                            << (11 + dither_scale);
-                                    }
-
-                                    acc + (acc_delta >> 18)
-                                        * (blki_abs as i64)
-                                        * (samples_per_au_recip << 2)
+                                    dither.map_or(0, |dither| dither.at(blki))
+                                        + (acc_delta >> 18) * blki_abs * (samples_per_au_recip << 2)
                                 }
                             )
                         );
@@ -1335,6 +1324,77 @@ impl MatrixTerms {
         }
 
         terms
+    }
+
+    /// Whether the matrix changes over the access unit.
+    fn has_delta(&self) -> bool {
+        self.delta[..self.count].iter().any(|&delta| delta != 0)
+    }
+}
+
+/// The dither a matrix adds to its products, out of the table the substream
+/// fills for each access unit.
+#[derive(Clone, Copy)]
+struct Dither<'a> {
+    table: &'a [i32],
+    index_mask: usize,
+    /// The matrix takes its dither `2 * step + 1` entries apart, from entry
+    /// `step` on: the later the matrix, the shorter its step.
+    step: usize,
+    /// The samples of the access unit decoded before the block.
+    decoded: usize,
+    shift: u32,
+}
+
+impl<'a> Dither<'a> {
+    /// `None` for a matrix that has no scale for it, and adds none.
+    fn new(
+        table: &'a [i32],
+        index_mask: usize,
+        step: usize,
+        decoded: usize,
+        scale: u8,
+    ) -> Option<Self> {
+        (scale != 0).then_some(Self {
+            table,
+            index_mask,
+            step,
+            decoded,
+            shift: 11 + scale as u32,
+        })
+    }
+
+    /// What the matrix adds to the products of row `blki` of the block.
+    #[inline(always)]
+    fn at(&self, blki: usize) -> i64 {
+        let blki_abs = blki + self.decoded;
+        let index = self.step * (2 * blki_abs + 1) + blki_abs;
+
+        (self.table[index & self.index_mask] as i64) << self.shift
+    }
+}
+
+/// [`apply_matrix`] for a matrix that holds still over the access unit: its
+/// products, and its dither where it has one.
+fn apply_steady_matrix(
+    terms: &MatrixTerms,
+    rows: &mut [[i32; 16]],
+    bypassed_lsb: &[[u8; 16]],
+    pmi: usize,
+    dest: usize,
+    mask: i32,
+    dither: Option<Dither<'_>>,
+) {
+    match dither {
+        Some(dither) => by_term_count!(
+            terms,
+            apply_matrix(terms, rows, bypassed_lsb, pmi, dest, mask, |blki, _| dither
+                .at(blki))
+        ),
+        None => by_term_count!(
+            terms,
+            apply_matrix(terms, rows, bypassed_lsb, pmi, dest, mask, |_, _| 0)
+        ),
     }
 }
 
