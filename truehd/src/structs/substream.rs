@@ -171,8 +171,10 @@ impl SubstreamSegment {
                 );
             }
             // Built in place; a block that fails to read fails the whole segment.
-            ss.block.push(Block::default());
-            let block = ss.block.last_mut().expect("a block was just pushed");
+            // Not `push`, which builds the block before it knows where it goes and
+            // then copies it there.
+            ss.block.resize_with(ss.block.len() + 1, Block::default);
+            let block = ss.block.last_mut().expect("a block was just added");
             block.read_into(state, reader)?;
             decoded += state.substream_state()?.restart.block_size;
             last_block_in_segment = reader.get()?;

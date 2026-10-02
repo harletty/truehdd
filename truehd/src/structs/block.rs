@@ -66,12 +66,15 @@ impl Default for Block {
 }
 
 impl BlockHeader {
-    fn read(state: &mut ParserState, reader: &mut BsIoSliceReader) -> Result<Self> {
+    /// Read a block header into `self`, which must be freshly defaulted. In place
+    /// because a header is 5 KiB of mostly absent updates, which returning it
+    /// would copy twice on the way to its block.
+    fn read_into(&mut self, state: &mut ParserState, reader: &mut BsIoSliceReader) -> Result<()> {
         let samples_per_au = state.samples_per_au;
         let restart = &mut state.substream_state_mut()?.restart;
         let max_shift = restart.max_shift;
 
-        let mut bh = BlockHeader::default();
+        let bh = self;
 
         if restart.guards.need_change(GuardsField::Guards) {
             // new_guards
@@ -150,7 +153,7 @@ impl BlockHeader {
             }
         }
 
-        Ok(bh)
+        Ok(())
     }
 
     pub fn update_decoder_state(&self, state: &mut DecoderState) -> Result<()> {
@@ -211,7 +214,9 @@ impl Block {
                 b.restart_header = Some(RestartHeader::read(state, reader)?);
             }
 
-            b.block_header = Some(BlockHeader::read(state, reader)?);
+            b.block_header
+                .insert(BlockHeader::default())
+                .read_into(state, reader)?;
         }
 
         b.block_data_bits = if state.substream_state()?.restart.error_protect {
