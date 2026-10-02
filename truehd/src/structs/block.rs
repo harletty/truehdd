@@ -455,17 +455,19 @@ impl Block {
             );
         }
 
-        // The matrices that bypass a bit, where each bypasses one at most.
-        let mut bypassing = [0usize; 16];
+        // The matrices that bypass bits, and how many: the count each states in
+        // a substream that has counts, one bit where it has a flag.
+        let mut bypassing = [(0usize, 0u32); 16];
         let mut bypassing_len = 0;
-        if restart_sync_word != 0x31EC {
-            for (pmi, _) in lsb_bypass_used
-                .iter()
-                .enumerate()
-                .take(primitive_matrices)
-                .filter(|(_, used)| **used)
-            {
-                bypassing[bypassing_len] = pmi;
+        for pmi in 0..primitive_matrices.min(16) {
+            let bits = if restart_sync_word == 0x31EC {
+                lsb_bypass_bit_count[pmi] as u32
+            } else {
+                lsb_bypass_used[pmi] as u32
+            };
+
+            if bits != 0 {
+                bypassing[bypassing_len] = (pmi, bits);
                 bypassing_len += 1;
             }
         }
@@ -481,32 +483,28 @@ impl Block {
             let mut bypassed_lsb_bits = 0;
 
             if restart_sync_word == 0x31EC {
-                for pmi in 0..primitive_matrices {
-                    let lsb_bypass_bit_count = lsb_bypass_bit_count[pmi] as u32;
-
-                    bypassed_lsb_row[pmi] = if lsb_bypass_bit_count == 0 {
-                        0
-                    } else if lsb_bypass_bit_count <= 8
-                        && let Some(bits) = window.take(lsb_bypass_bit_count)
+                for &(pmi, count) in bypassing {
+                    bypassed_lsb_row[pmi] = if count <= 8
+                        && let Some(bits) = window.take(count)
                     {
                         bits as u8
                     } else {
                         reader.resume(&window);
-                        let bits = reader.get_n::<u8>(lsb_bypass_bit_count)?;
+                        let bits = reader.get_n::<u8>(count)?;
                         window = reader.window();
                         bits
                     };
-                    bypassed_lsb_bits += lsb_bypass_bit_count as u64;
+                    bypassed_lsb_bits += count as u64;
                 }
             } else {
                 // All of them out of one look at the stream.
                 if let Some(bits) = window.take(bypassing.len() as u32) {
-                    for (read, &pmi) in bypassing.iter().enumerate() {
+                    for (read, &(pmi, _)) in bypassing.iter().enumerate() {
                         bypassed_lsb_row[pmi] = ((bits >> (bypassing.len() - 1 - read)) & 1) as u8;
                     }
                 } else {
                     reader.resume(&window);
-                    for &pmi in bypassing {
+                    for &(pmi, _) in bypassing {
                         bypassed_lsb_row[pmi] = reader.get_n::<u8>(1)?;
                     }
                     window = reader.window();
