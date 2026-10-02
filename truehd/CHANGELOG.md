@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BREAKING**: `Block::block_data` and `Block::bypassed_lsb` are vectors of one row per sample of the block instead of arrays of 160 rows, and the bypassed bits are `u8`. Index them as before, within the block. Decoding takes 2 to 8% less time
 - Decoding no longer interpolates a lossless matrix whose coefficients hold still over the access unit, as most of those of an object substream do, and the presentation that has one takes 5 to 12% less time
 - Parsing settles once per block which matrices of a substream with bypass counts bypass any bits, as it did for one with bypass flags, and the presentation that has an object substream takes 3 to 5% less time
+- `Extractor` copies an access unit once into the `Frame` it returns, instead of into a 64 KiB vector first and from there into the frame
 - **BREAKING**: `structs::oamd` re-exports the [`oamd`](https://crates.io/crates/oamd) crate, which now owns these structures. Every type and function keeps the path it had, but `TEST_DATA` is `EXAMPLE_DATA` there and the other test payloads are no longer public
 
 ### Fixed

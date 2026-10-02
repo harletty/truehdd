@@ -1,7 +1,6 @@
 use crate::log_or_err;
 use crate::structs::sync::{MAJOR_SYNC_FBA, MAJOR_SYNC_FBB};
 use crate::structs::timestamp::Timestamp;
-use crate::utils::buffer_pool::BufferPool;
 use crate::utils::crc::{CRC_MAJOR_SYNC_INFO_ALG, Crc16};
 use crate::utils::errors::ExtractError;
 use anyhow::Result;
@@ -54,7 +53,6 @@ pub struct Extractor {
     io_counter: usize,
     substreams: usize,
     crc: Crc16,
-    buffer_pool: BufferPool,
     error_count: usize,
     frames_processed: usize,
     fail_level: log::Level,
@@ -72,7 +70,6 @@ impl Default for Extractor {
             io_counter: 0,
             substreams: 0,
             crc: Crc16::new(&CRC_MAJOR_SYNC_INFO_ALG),
-            buffer_pool: BufferPool::default(),
             error_count: 0,
             frames_processed: 0,
             fail_level: log::Level::Error,
@@ -467,16 +464,16 @@ impl Iterator for Extractor {
                     return self.iter_insufficient();
                 };
 
-                // Use pooled buffer for zero-copy frame creation
-                let mut frame_buffer = self.buffer_pool.acquire();
-                frame_buffer.extend_from_slice(&self.buffered()[..access_unit_len]);
+                // Straight into the allocation the frame keeps: a vector on the way
+                // would be copied into it and dropped.
+                let data = Arc::from(&self.buffered()[..access_unit_len]);
                 let offset = self.consumed;
                 let timestamp = self.timestamp.take();
                 self.consume_front(access_unit_len);
 
                 let frame = Frame {
                     timestamp,
-                    data: frame_buffer.into(),
+                    data,
                     index: self.frames_processed as u64,
                     offset,
                 };
