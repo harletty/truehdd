@@ -1114,6 +1114,70 @@ mod avx2 {
         unsafe { _mm_storeu_si128(lanes.as_mut_ptr().cast(), value) }
     }
 
+    #[inline(always)]
+    fn load_eight(channels: &[i32]) -> __m256i {
+        let channels: &[i32; 8] = channels.try_into().expect("eight channels");
+
+        // SAFETY: an array of eight `i32` is 32 readable bytes.
+        unsafe { _mm256_loadu_si256(channels.as_ptr().cast()) }
+    }
+
+    /// The sum of the products of eight channels with their coefficients, in
+    /// four parts. `odd_coeff` is `coeff` with each two neighbours swapped: a
+    /// multiplication takes every other value, so the odd ones are swapped
+    /// into the places of the even ones, with a shuffle rather than a 64-bit
+    /// shift, which the compiler would take for the widening of a product it
+    /// then has to make up from several.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn products(coeff: __m256i, odd_coeff: __m256i, channels: __m256i) -> __m256i {
+        _mm256_add_epi64(
+            _mm256_mul_epi32(coeff, channels),
+            _mm256_mul_epi32(odd_coeff, _mm256_shuffle_epi32::<0xB1>(channels)),
+        )
+    }
+
+    /// See [`super::apply_matrix`], for a matrix without deltas. `coeff` has a
+    /// matrix's coefficients in the places of their channels, and a row's
+    /// products are taken eight channels at a time: all sixteen with `UPPER`,
+    /// the lower eight without, for a matrix that reads none of the others.
+    /// `extra` is given the row's index in the block.
+    #[target_feature(enable = "avx2")]
+    pub(super) fn apply_matrix<const UPPER: bool>(
+        coeff: &[i32; 16],
+        rows: &mut [[i32; 16]],
+        bypassed_lsb: &[[u8; 16]],
+        pmi: usize,
+        dest: usize,
+        mask: i32,
+        extra: impl Fn(usize) -> i64,
+    ) {
+        let lower_coeff = load_eight(&coeff[..8]);
+        let lower_odd_coeff = _mm256_shuffle_epi32::<0xB1>(lower_coeff);
+        let upper_coeff = load_eight(&coeff[8..]);
+        let upper_odd_coeff = _mm256_shuffle_epi32::<0xB1>(upper_coeff);
+
+        for (blki, (row, bypassed_lsb)) in rows.iter_mut().zip(bypassed_lsb).enumerate() {
+            let mut parts = products(lower_coeff, lower_odd_coeff, load_eight(&row[..8]));
+
+            if UPPER {
+                parts = _mm256_add_epi64(
+                    parts,
+                    products(upper_coeff, upper_odd_coeff, load_eight(&row[8..])),
+                );
+            }
+
+            let halves = _mm_add_epi64(
+                _mm256_castsi256_si128(parts),
+                _mm256_extracti128_si256::<1>(parts),
+            );
+            let acc = _mm_cvtsi128_si64(_mm_add_epi64(halves, _mm_unpackhi_epi64(halves, halves)))
+                + extra(blki);
+
+            row[dest] = (((acc >> 18) as i32) & mask) + bypassed_lsb[pmi] as i32;
+        }
+    }
+
     /// See [`super::recorrelate_lanes`]. Lane `l` is channel `first + l`, where
     /// `first` is `chi` unless that would run past the sixteenth channel. A lane
     /// outside `chi..chi + filters.len()` has zero coefficients and takes zero
@@ -1326,6 +1390,21 @@ impl MatrixTerms {
         terms
     }
 
+    /// The coefficients in the places of their channels, zero for the channels
+    /// the matrix does not read, and whether it reads any of the upper eight.
+    #[cfg(target_arch = "x86_64")]
+    fn by_channel(&self) -> ([i32; 16], bool) {
+        let mut coeff = [0; 16];
+        let mut upper = false;
+
+        for (&channel, &term) in self.channel[..self.count].iter().zip(&self.coeff) {
+            coeff[(channel & 15) as usize] = term;
+            upper |= channel >= 8;
+        }
+
+        (coeff, upper)
+    }
+
     /// Whether the matrix changes over the access unit.
     fn has_delta(&self) -> bool {
         self.delta[..self.count].iter().any(|&delta| delta != 0)
@@ -1374,9 +1453,64 @@ impl<'a> Dither<'a> {
     }
 }
 
+/// The fewest products for which a matrix is taken a whole row at a time: the
+/// row's eight or sixteen channels cost the two or four multiplications that
+/// as many products cost one at a time, and their sum a few steps more.
+const WHOLE_ROW_TERMS: usize = 5;
+
 /// [`apply_matrix`] for a matrix that holds still over the access unit: its
 /// products, and its dither where it has one.
 fn apply_steady_matrix(
+    terms: &MatrixTerms,
+    rows: &mut [[i32; 16]],
+    bypassed_lsb: &[[u8; 16]],
+    pmi: usize,
+    dest: usize,
+    mask: i32,
+    dither: Option<Dither<'_>>,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if terms.count >= WHOLE_ROW_TERMS && std::arch::is_x86_feature_detected!("avx2") {
+        let (coeff, upper) = terms.by_channel();
+
+        // SAFETY: the processor has AVX2, which is all the function requires.
+        unsafe {
+            match (dither, upper) {
+                (Some(dither), false) => avx2::apply_matrix::<false>(
+                    &coeff,
+                    rows,
+                    bypassed_lsb,
+                    pmi,
+                    dest,
+                    mask,
+                    |blki| dither.at(blki),
+                ),
+                (Some(dither), true) => avx2::apply_matrix::<true>(
+                    &coeff,
+                    rows,
+                    bypassed_lsb,
+                    pmi,
+                    dest,
+                    mask,
+                    |blki| dither.at(blki),
+                ),
+                (None, false) => {
+                    avx2::apply_matrix::<false>(&coeff, rows, bypassed_lsb, pmi, dest, mask, |_| 0)
+                }
+                (None, true) => {
+                    avx2::apply_matrix::<true>(&coeff, rows, bypassed_lsb, pmi, dest, mask, |_| 0)
+                }
+            }
+        }
+
+        return;
+    }
+
+    apply_steady_matrix_by_term(terms, rows, bypassed_lsb, pmi, dest, mask, dither);
+}
+
+/// [`apply_steady_matrix`] one product at a time.
+fn apply_steady_matrix_by_term(
     terms: &MatrixTerms,
     rows: &mut [[i32; 16]],
     bypassed_lsb: &[[u8; 16]],
@@ -1445,6 +1579,64 @@ fn padded_rows<T: Copy + Default>(rows: &[[T; 16]]) -> Box<[[T; 16]; 160]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A matrix taken a whole row at a time leaves the rows that one product at
+    /// a time leaves, whichever channels it reads, with and without dither.
+    #[test]
+    fn whole_rows_match_one_product_at_a_time() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = |bits: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed as i64 >> (64 - bits)) as i32
+        };
+        let table: Vec<i32> = (0..64).map(|_| random(8)).collect();
+        let (mut whole, mut upper) = (0, 0);
+
+        for round in 0..2000usize {
+            // Of all sixteen channels, or of the lower eight alone.
+            let channels = if round % 3 == 0 { 8 } else { 16 };
+            let mut coeff = [0; 16];
+            for coeff in &mut coeff[..channels] {
+                if random(2) != 0 {
+                    *coeff = random(16);
+                }
+            }
+            let terms = MatrixTerms::new(&coeff, &[]);
+            whole += (terms.count >= WHOLE_ROW_TERMS) as usize;
+            upper += (terms.count >= WHOLE_ROW_TERMS && channels == 16) as usize;
+
+            let block_size = 8 + round % 153;
+            let rows: Vec<[i32; 16]> = (0..block_size)
+                .map(|_| core::array::from_fn(|_| random(24)))
+                .collect();
+            let bypassed_lsb: Vec<[u8; 16]> = (0..block_size)
+                .map(|_| core::array::from_fn(|_| (random(2) & 1) as u8))
+                .collect();
+            let (pmi, dest) = (round % 16, random(5) as usize & 15);
+            let mask = !((1 << (round % 3)) - 1);
+            let dither = Dither::new(&table, 63, 1 + round % 5, round % 40, (round % 4) as u8);
+
+            let mut expected = rows.clone();
+            apply_steady_matrix_by_term(
+                &terms,
+                &mut expected,
+                &bypassed_lsb,
+                pmi,
+                dest,
+                mask,
+                dither,
+            );
+            let mut actual = rows;
+            apply_steady_matrix(&terms, &mut actual, &bypassed_lsb, pmi, dest, mask, dither);
+
+            assert_eq!(actual, expected, "round {round}");
+        }
+
+        // Both kinds of rows were taken whole, where the processor can.
+        assert!(whole > 500 && upper > 500 && whole - upper > 100);
+    }
 
     /// The lanes leave the rows and the filter states that one channel at a time
     /// leaves, and refuse the blocks in which a state leaves its range.
