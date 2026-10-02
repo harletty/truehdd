@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `Decoder::decode_presentation_into` decodes into a `DecodedAccessUnit` the caller keeps, which `Default` now gives, instead of building one for every access unit: it writes only the rows the access unit decodes and reuses the vectors. A caller that holds one for the stream decodes about 5% faster
 - `AccessUnit::has_invalid_branch` and `DecoderState::has_invalid_branch` mark the access unit where the stream restarts at a branch the buffer-model conditions reject, the counterpart of `has_valid_branch` (#37)
 
 ### Changed

@@ -63,6 +63,42 @@ impl Decoder {
         }
     }
 
+    /// Decodes an access unit to PCM audio samples, into a result that is
+    /// already there.
+    ///
+    /// As [`decode_presentation`](Self::decode_presentation), which builds a new
+    /// [`DecodedAccessUnit`] for every access unit: 10 KiB of samples, most of
+    /// them past the end of the access unit, and two allocations. Here the
+    /// samples of the access unit are written over those `decoded` holds and
+    /// its vectors are reused, so one `DecodedAccessUnit`, which
+    /// [`Default`] gives, serves a whole stream.
+    ///
+    /// Only the rows the access unit decodes are written. Whatever `decoded`
+    /// held past them stays, where `decode_presentation` returns zeros.
+    pub fn decode_presentation_into(
+        &mut self,
+        access_unit: &AccessUnit,
+        presentation: usize,
+        decoded: &mut DecodedAccessUnit,
+    ) -> Result<()> {
+        let mut required_presentations = [false; MAX_PRESENTATIONS];
+        required_presentations[presentation] = true;
+
+        self.state
+            .decode_access_unit(access_unit, &required_presentations)?;
+
+        let substream_info_changed = std::mem::take(&mut self.state.substream_info_changed);
+
+        match self.state.effective_presentations.iter().position(|&p| p) {
+            Some(i) => {
+                self.state
+                    .fill_decoded_result(i, substream_info_changed, decoded);
+                Ok(())
+            }
+            None => Err(anyhow!("Failed to get presentation {presentation}")),
+        }
+    }
+
     /// Decodes multiple presentations from an access unit.
     ///
     /// Takes a boolean array indicating which presentations are required
@@ -164,6 +200,22 @@ pub struct DecodedAccessUnit {
     /// This is `true` when substream_info or extended_substream_info changed,
     /// indicating that channel layout may have changed requiring new output files.
     pub substream_info_changed: bool,
+}
+
+impl Default for DecodedAccessUnit {
+    /// No samples of no channels, as a result to decode into.
+    fn default() -> Self {
+        Self {
+            sampling_frequency: 0,
+            sample_length: 0,
+            channel_count: 0,
+            pcm_data: [[0; 16]; 160],
+            channel_labels: vec![],
+            oamd: vec![],
+            is_duplicate: false,
+            substream_info_changed: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -898,6 +950,30 @@ impl DecoderState {
         };
 
         Ok(decoded)
+    }
+
+    /// [`create_decoded_result`](Self::create_decoded_result) over a result that
+    /// is already there, writing only the rows the access unit decoded.
+    fn fill_decoded_result(
+        &self,
+        presentation_idx: usize,
+        substream_info_changed: bool,
+        decoded: &mut DecodedAccessUnit,
+    ) {
+        let ss_state = &self.substream_state[presentation_idx];
+        let rows = self.samples_per_au.min(decoded.pcm_data.len());
+
+        decoded.channel_labels.clone_from(&ss_state.channel_labels);
+        decoded.sampling_frequency = self.sampling_frequency;
+        decoded.sample_length = self.samples_per_au - ss_state.zero_samples;
+        decoded.channel_count = ss_state.max_matrix_chan + 1;
+        decoded.pcm_data[..rows].copy_from_slice(&ss_state.output_buffer[..rows]);
+        decoded.oamd.clear();
+        if presentation_idx == 3 && self.effective_presentations[3] {
+            decoded.oamd.extend(self.oamd.iter().cloned());
+        }
+        decoded.is_duplicate = self.has_duplicate_timing && self.has_duplicate_sample;
+        decoded.substream_info_changed = substream_info_changed;
     }
 }
 

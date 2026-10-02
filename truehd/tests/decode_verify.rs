@@ -119,6 +119,68 @@ fn decode_stream(
     Ok(out)
 }
 
+/// Decoding into a result that is kept gives, access unit after access unit,
+/// what decoding into a new one gives.
+#[test]
+fn decoding_into_a_kept_result_matches_a_new_one() {
+    for (name, data) in [
+        ("fba_2ch", FBA_2CH_SLICE),
+        ("fba_atmos_cbi", FBA_ATMOS_CBI_SLICE),
+        ("fba_atmos_dimtrim", FBA_ATMOS_DIMTRIM),
+        ("fbb_6ch", FBB_6CH_SLICE),
+        ("fbb_copy", FBB_COPY_SLICE),
+        ("fba_spliced", FBA_SPLICED),
+        ("fbb_spliced", FBB_SPLICED),
+    ] {
+        for presentation in 0..MAX_PRESENTATIONS {
+            let mut extractor = Extractor::default();
+            extractor.push_bytes(data);
+
+            let mut parser = Parser::default();
+            let mut new_decoder = Decoder::default();
+            let mut kept_decoder = Decoder::default();
+            let mut kept = truehd::process::decode::DecodedAccessUnit::default();
+            let mut decoded_units = 0;
+
+            for (index, result) in (&mut extractor).enumerate() {
+                let Ok(frame) = result else { break };
+                let Ok(access_unit) = parser.parse(&frame) else {
+                    break;
+                };
+                let new = new_decoder.decode_presentation(&access_unit, presentation);
+                let into =
+                    kept_decoder.decode_presentation_into(&access_unit, presentation, &mut kept);
+                let at = format!("{name}, presentation {presentation}, access unit {index}");
+
+                let Ok(new) = new else {
+                    assert!(into.is_err(), "{at}");
+                    break;
+                };
+                into.unwrap_or_else(|error| panic!("{at}: {error}"));
+
+                assert_eq!(kept.sampling_frequency, new.sampling_frequency, "{at}");
+                assert_eq!(kept.sample_length, new.sample_length, "{at}");
+                assert_eq!(kept.channel_count, new.channel_count, "{at}");
+                assert_eq!(kept.pcm_data, new.pcm_data, "{at}");
+                assert_eq!(kept.channel_labels, new.channel_labels, "{at}");
+                assert_eq!(
+                    format!("{:?}", kept.oamd),
+                    format!("{:?}", new.oamd),
+                    "{at}"
+                );
+                assert_eq!(kept.is_duplicate, new.is_duplicate, "{at}");
+                assert_eq!(
+                    kept.substream_info_changed, new.substream_info_changed,
+                    "{at}"
+                );
+                decoded_units += 1;
+            }
+
+            assert!(decoded_units > 0 || presentation > 0, "{name}");
+        }
+    }
+}
+
 fn require(indices: &[usize]) -> [bool; MAX_PRESENTATIONS] {
     let mut required = [false; MAX_PRESENTATIONS];
     for &i in indices {
