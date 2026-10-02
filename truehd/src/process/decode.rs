@@ -4,11 +4,25 @@ use crate::structs::access_unit::AccessUnit;
 use crate::structs::block::Block;
 use crate::structs::channel::ChannelLabel;
 use crate::structs::oamd::ObjectAudioMetadataPayload;
-use crate::utils::dither::dither_31eb;
+use crate::utils::dither::fill_dither_31eb;
 use crate::utils::errors::DecodeError;
 use anyhow::{Result, anyhow, bail};
 use log::{info, trace};
 use std::collections::VecDeque;
+
+/// Call `$function::<N>` with `N` the number of terms the matrix has, so that the
+/// products of a sample are straight multiply-adds rather than a loop.
+macro_rules! by_term_count {
+    ($terms:expr, $function:ident $args:tt) => {
+        by_term_count!(@arms $terms, $function, $args, 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15)
+    };
+    (@arms $terms:expr, $function:ident, $args:tt, $($n:literal)*) => {
+        match $terms.count {
+            $($n => $function::<$n> $args,)*
+            _ => $function::<16> $args,
+        }
+    };
+}
 
 /// Decodes access units to PCM audio samples.
 ///
@@ -493,7 +507,6 @@ impl DecoderState {
             primitive_matrices,
             matrix_ch,
             dither_scale,
-            delta_cf,
 
             output_shift,
             quantiser_step_size,
@@ -582,155 +595,178 @@ impl DecoderState {
 
         // lossless matrix
         if self.effective_presentations[current_substream_index] {
+            let decoded_sample_len =
+                self.substream_state[current_substream_index].decoded_sample_len;
+            let block_rows = decoded_sample_len..decoded_sample_len + block_size;
+
             if let Some(presentation_map) = self.presentation_map {
                 let substream_mask =
                     presentation_map.substream_mask_by_index(current_substream_index);
-                let decoded_sample_len =
-                    self.substream_state[current_substream_index].decoded_sample_len;
 
                 for i in 0..=current_substream_index {
                     if (substream_mask >> i) & 1 == 0 {
                         continue;
                     }
 
-                    let min_chan = self.substream_state[i].min_chan;
-                    let max_chan = self.substream_state[i].max_chan;
+                    let from = &self.substream_state[i];
+                    let from_rows = &from.rematrix_buffer[block_rows.clone()];
+                    let to_rows = &mut self.rematrix_buffer[block_rows.clone()];
 
-                    for blki in 0..block_size {
-                        for ch in min_chan..=max_chan {
-                            self.rematrix_buffer[decoded_sample_len + blki][ch] = self
-                                .substream_state[i]
-                                .rematrix_buffer[decoded_sample_len + blki][ch];
+                    // A channel at a time: a substream brings a few channels of the
+                    // row, and a copy of that run is a call for a handful of bytes.
+                    for chi in from.min_chan..=from.max_chan {
+                        for (to, from) in to_rows.iter_mut().zip(from_rows) {
+                            to[chi] = from[chi];
                         }
                     }
                 }
             }
 
             let ss_state = &mut self.substream_state[current_substream_index];
-            let decoded_sample_len = &mut ss_state.decoded_sample_len;
-            let dither_seed = &mut ss_state.dither_seed;
-            let bypassed_lsb = &block.bypassed_lsb;
-            let m_coeff = &mut ss_state.m_coeff;
-            let dither_table = &mut ss_state.dither_table;
-            let rematrix_buffer = &mut self.rematrix_buffer[*decoded_sample_len..];
+            let rows = &mut self.rematrix_buffer[block_rows.clone()];
+            let bypassed_lsb = &block.bypassed_lsb[..block_size];
+            let matrix_terms = if restart_sync_word == 0x31EA {
+                max_matrix_chan + 3
+            } else {
+                max_matrix_chan + 1
+            };
 
+            // A matrix at a time over the whole block, not a sample at a time through
+            // every matrix: the samples are independent of each other, so one matrix's
+            // products overlap from one sample to the next, where the matrices of one
+            // sample each wait on the channel the one before wrote. It also settles
+            // once per block which products a matrix has at all.
             match restart_sync_word {
                 0x31EA => {
-                    for blki in 0..block_size {
-                        let rematrix_buffer = &mut rematrix_buffer[blki];
-                        let bypassed_lsb = &bypassed_lsb[blki];
+                    let dither_seed = &mut ss_state.dither_seed;
+
+                    for row in rows.iter_mut() {
                         let dither_seed_shr7 = *dither_seed >> 7;
 
-                        rematrix_buffer[max_matrix_chan + 1] =
+                        row[max_matrix_chan + 1] =
                             (((*dither_seed >> 15) as i8) << dither_shift) as i32;
-                        rematrix_buffer[max_matrix_chan + 2] =
+                        row[max_matrix_chan + 2] =
                             ((dither_seed_shr7 as i8) << dither_shift) as i32;
 
                         *dither_seed =
                             (dither_seed_shr7 ^ (dither_seed_shr7 << 5) ^ (*dither_seed << 16))
                                 & 0x7FFFFF;
+                    }
 
-                        for pmi in 0..primitive_matrices {
-                            let mut acc = 0;
-                            let matrix_ch = matrix_ch[pmi] as usize;
-                            let m_coeff = &m_coeff[pmi];
+                    #[allow(clippy::needless_range_loop)]
+                    for pmi in 0..primitive_matrices {
+                        let dest = matrix_ch[pmi] as usize;
+                        let mask = !((1 << quantiser_step_size[dest]) - 1);
+                        let terms = MatrixTerms::new(&ss_state.m_coeff[pmi][..matrix_terms], &[]);
 
-                            for chi in 0..=max_matrix_chan + 2 {
-                                acc += rematrix_buffer[chi] as i64 * m_coeff[chi] as i64;
-                            }
-
-                            rematrix_buffer[matrix_ch] = (((acc >> 18) as i32)
-                                & (!((1 << quantiser_step_size[matrix_ch]) - 1)))
-                                + bypassed_lsb[pmi];
-                        }
+                        by_term_count!(
+                            terms,
+                            apply_matrix(&terms, rows, bypassed_lsb, pmi, dest, mask, |_, _| 0)
+                        );
                     }
                 }
                 0x31EB => {
-                    if *decoded_sample_len == 0 {
-                        dither_table[..samples_per_au.next_power_of_two()]
-                            .copy_from_slice(&dither_31eb(samples_per_au, dither_seed));
-                    }
-
                     let dither_index_mask = samples_per_au.next_power_of_two() - 1;
 
-                    for blki in 0..block_size {
-                        let rematrix_buffer = &mut rematrix_buffer[blki];
-                        let bypassed_lsb = &bypassed_lsb[blki];
-                        let blki_abs = blki + *decoded_sample_len;
+                    if decoded_sample_len == 0 {
+                        fill_dither_31eb(
+                            &mut ss_state.dither_table[..=dither_index_mask],
+                            &mut ss_state.dither_seed,
+                        );
+                    }
 
-                        for pmi in 0..primitive_matrices {
-                            let mut acc = 0;
-                            let m_coeff = &m_coeff[pmi];
-                            let dither_scale = dither_scale[pmi] as i64;
-                            let matrix_ch = matrix_ch[pmi] as usize;
+                    let dither_table = &ss_state.dither_table;
 
-                            let dither_index =
-                                (primitive_matrices - pmi) * (2 * blki_abs + 1) + blki_abs;
+                    for pmi in 0..primitive_matrices {
+                        let dest = matrix_ch[pmi] as usize;
+                        let mask = !((1 << quantiser_step_size[dest]) - 1);
+                        let terms = MatrixTerms::new(&ss_state.m_coeff[pmi][..matrix_terms], &[]);
+                        let dither_scale = dither_scale[pmi] as i64;
 
-                            for chi in 0..=max_matrix_chan {
-                                acc += rematrix_buffer[chi] as i64 * m_coeff[chi] as i64;
-                            }
+                        if dither_scale != 0 {
+                            let step = primitive_matrices - pmi;
+                            by_term_count!(
+                                terms,
+                                apply_matrix(
+                                    &terms,
+                                    rows,
+                                    bypassed_lsb,
+                                    pmi,
+                                    dest,
+                                    mask,
+                                    |blki, _| {
+                                        let blki_abs = blki + decoded_sample_len;
+                                        let dither_index = step * (2 * blki_abs + 1) + blki_abs;
 
-                            if dither_scale != 0 {
-                                acc += (dither_table[dither_index & dither_index_mask] as i64)
-                                    << (11 + dither_scale);
-                            }
-
-                            rematrix_buffer[matrix_ch] = (((acc >> 18) as i32)
-                                & (!((1 << quantiser_step_size[matrix_ch]) - 1)))
-                                + bypassed_lsb[pmi];
+                                        (dither_table[dither_index & dither_index_mask] as i64)
+                                            << (11 + dither_scale)
+                                    }
+                                )
+                            );
+                        } else {
+                            by_term_count!(
+                                terms,
+                                apply_matrix(&terms, rows, bypassed_lsb, pmi, dest, mask, |_, _| 0)
+                            );
                         }
                     }
                 }
                 0x31EC => {
-                    if *decoded_sample_len == 0 {
-                        dither_table[..samples_per_au.next_power_of_two()]
-                            .copy_from_slice(&dither_31eb(samples_per_au, dither_seed));
-                    }
-
                     let dither_index_mask = samples_per_au.next_power_of_two() - 1;
 
-                    let samples_per_au_recip = (1 << 16) / samples_per_au as i64;
-
-                    for blki in 0..block_size {
-                        let rematrix_buffer = &mut rematrix_buffer[blki];
-                        let bypassed_lsb = &bypassed_lsb[blki];
-                        let blki_abs = blki + *decoded_sample_len;
-
-                        for pmi in 0..primitive_matrices {
-                            let mut acc = 0;
-                            let mut acc_delta = 0;
-                            let dither_scale = dither_scale[pmi] as u64;
-                            let matrix_ch = matrix_ch[pmi] as usize;
-                            let m_coeff = &m_coeff[pmi];
-                            let delta_cf = &delta_cf[pmi];
-
-                            let dither_index =
-                                (primitive_matrices - pmi) * (2 * blki_abs + 1) + blki_abs;
-
-                            for chi in 0..=max_matrix_chan {
-                                acc += rematrix_buffer[chi] as i64 * m_coeff[chi] as i64;
-                                acc_delta += rematrix_buffer[chi] as i64 * delta_cf[chi] as i64;
-                            }
-
-                            if dither_scale != 0 {
-                                acc += (dither_table[dither_index & dither_index_mask] as i64)
-                                    << (11 + dither_scale);
-                            }
-
-                            acc +=
-                                (acc_delta >> 18) * (blki_abs as i64) * (samples_per_au_recip << 2);
-
-                            rematrix_buffer[matrix_ch] = (((acc >> 18) as i32)
-                                & (!((1 << quantiser_step_size[matrix_ch]) - 1)))
-                                + bypassed_lsb[pmi];
-                        }
+                    if decoded_sample_len == 0 {
+                        fill_dither_31eb(
+                            &mut ss_state.dither_table[..=dither_index_mask],
+                            &mut ss_state.dither_seed,
+                        );
                     }
 
-                    if *decoded_sample_len + block_size == samples_per_au {
+                    let dither_table = &ss_state.dither_table;
+                    let samples_per_au_recip = (1 << 16) / samples_per_au as i64;
+
+                    for pmi in 0..primitive_matrices {
+                        let dest = matrix_ch[pmi] as usize;
+                        let mask = !((1 << quantiser_step_size[dest]) - 1);
+                        let terms = MatrixTerms::new(
+                            &ss_state.m_coeff[pmi][..matrix_terms],
+                            &ss_state.delta_cf[pmi][..matrix_terms],
+                        );
+                        let dither_scale = dither_scale[pmi] as u64;
+                        let step = primitive_matrices - pmi;
+
+                        by_term_count!(
+                            terms,
+                            apply_matrix(
+                                &terms,
+                                rows,
+                                bypassed_lsb,
+                                pmi,
+                                dest,
+                                mask,
+                                |blki, acc_delta| {
+                                    let blki_abs = blki + decoded_sample_len;
+                                    let mut acc = 0;
+
+                                    if dither_scale != 0 {
+                                        let dither_index = step * (2 * blki_abs + 1) + blki_abs;
+
+                                        acc += (dither_table[dither_index & dither_index_mask]
+                                            as i64)
+                                            << (11 + dither_scale);
+                                    }
+
+                                    acc + (acc_delta >> 18)
+                                        * (blki_abs as i64)
+                                        * (samples_per_au_recip << 2)
+                                }
+                            )
+                        );
+                    }
+
+                    if decoded_sample_len + block_size == samples_per_au {
                         for pmi in 0..primitive_matrices {
-                            let m_coeff = &mut m_coeff[pmi];
-                            let delta_cf = &delta_cf[pmi];
+                            let m_coeff = &mut ss_state.m_coeff[pmi];
+                            let delta_cf = &ss_state.delta_cf[pmi];
                             for chi in 0..=max_matrix_chan {
                                 m_coeff[chi] += delta_cf[chi];
                             }
@@ -742,9 +778,9 @@ impl DecoderState {
 
             // remap
             {
-                let output_buffer = &mut ss_state.output_buffer[*decoded_sample_len..];
+                let output_rows = &mut ss_state.output_buffer[block_rows];
 
-                if *decoded_sample_len == 0 {
+                if decoded_sample_len == 0 {
                     ss_state.lossless_check_i32 = 0;
                     ss_state.output_bits = 0;
                 }
@@ -752,35 +788,34 @@ impl DecoderState {
                 let mut lossless_check_data = 0;
                 let mut output_bits = 0u32;
 
-                for blki in 0..block_size {
-                    let sample = rematrix_buffer[blki];
-                    let mut output = [0; 16];
+                // A channel at a time, so that its shift and its place are settled
+                // once. The rows need no clearing: the channels written are the same
+                // from one restart header to the next, which starts from zeroed rows.
+                for chi in 0..max_matrix_chan + 1 {
+                    let ch_assign = ch_assign[chi];
+                    let output_shift = output_shift[chi];
 
-                    for chi in 0..=max_matrix_chan {
-                        let ch_assign = ch_assign[chi];
-                        let output = &mut output[ch_assign];
+                    for (row, output_row) in rows.iter().zip(output_rows.iter_mut()) {
+                        let mut output = row[chi];
 
-                        *output = sample[chi];
-
-                        let output_shift = output_shift[chi];
                         if output_shift < 0 {
-                            *output >>= -output_shift;
+                            output >>= -output_shift;
                         } else {
-                            *output <<= output_shift;
+                            output <<= output_shift;
                         }
 
-                        lossless_check_data ^= (*output & 0xFFFFFF) << (chi & 7);
-                        output_bits |= (*output ^ (*output >> 31)) as u32;
-                    }
+                        output_row[ch_assign] = output;
 
-                    output_buffer[blki] = output;
+                        lossless_check_data ^= (output & 0xFFFFFF) << (chi & 7);
+                        output_bits |= (output ^ (output >> 31)) as u32;
+                    }
                 }
 
                 ss_state.output_bits |= output_bits;
                 ss_state.lossless_check_i32 ^= lossless_check_data;
                 ss_state.lossless_check_i32_accum ^= lossless_check_data;
 
-                if *decoded_sample_len + block_size == samples_per_au {
+                if decoded_sample_len + block_size == samples_per_au {
                     trace!(
                         "AU {}: lossless_check_i32: {:08X}, lossless_check_i32_prev_au {:08X}",
                         self.counter,
@@ -854,5 +889,78 @@ impl DecoderState {
         };
 
         Ok(decoded)
+    }
+}
+
+/// The products of one primitive matrix that are not zero: which channels of the
+/// sample row it reads, and with which coefficients. A matrix of a 7.1 substream
+/// often reads half of the eight channels, and one that only rescales a channel
+/// reads one.
+struct MatrixTerms {
+    count: usize,
+    channel: [u8; 16],
+    coeff: [i32; 16],
+    /// The coefficient deltas of the same channels, for the substream that
+    /// interpolates its matrices.
+    delta: [i32; 16],
+}
+
+impl MatrixTerms {
+    /// From a matrix's coefficients and, where it has them, its deltas; a channel
+    /// is kept when either is not zero.
+    fn new(coeff: &[i32], delta: &[i32]) -> Self {
+        let mut terms = Self {
+            count: 0,
+            channel: [0; 16],
+            coeff: [0; 16],
+            delta: [0; 16],
+        };
+
+        for (chi, &coeff) in coeff.iter().enumerate() {
+            let delta = delta.get(chi).copied().unwrap_or(0);
+
+            if coeff != 0 || delta != 0 {
+                terms.channel[terms.count] = chi as u8;
+                terms.coeff[terms.count] = coeff;
+                terms.delta[terms.count] = delta;
+                terms.count += 1;
+            }
+        }
+
+        terms
+    }
+}
+
+/// Apply one primitive matrix to every sample row of a block: channel `dest`
+/// becomes the sum of the matrix's `N` products and of `extra`, which is given
+/// the row's index in the block and the sum of its products with the deltas.
+#[inline(always)]
+fn apply_matrix<const N: usize>(
+    terms: &MatrixTerms,
+    rows: &mut [[i32; 16]],
+    bypassed_lsb: &[[i32; 16]],
+    pmi: usize,
+    dest: usize,
+    mask: i32,
+    extra: impl Fn(usize, i64) -> i64,
+) {
+    let channel: &[u8; N] = terms.channel[..N].try_into().unwrap();
+    let coeff: &[i32; N] = terms.coeff[..N].try_into().unwrap();
+    let delta: &[i32; N] = terms.delta[..N].try_into().unwrap();
+
+    for (blki, (row, bypassed_lsb)) in rows.iter_mut().zip(bypassed_lsb).enumerate() {
+        let mut acc = 0i64;
+        let mut acc_delta = 0i64;
+
+        for i in 0..N {
+            let sample = row[(channel[i] & 15) as usize] as i64;
+
+            acc += coeff[i] as i64 * sample;
+            acc_delta += delta[i] as i64 * sample;
+        }
+
+        acc += extra(blki, acc_delta);
+
+        row[dest] = (((acc >> 18) as i32) & mask) + bypassed_lsb[pmi];
     }
 }

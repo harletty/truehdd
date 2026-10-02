@@ -29,15 +29,19 @@ pub const DITHER_LUT: [i32; 256] = [
 /// Creates a power-of-two sized dither table using the specified seed
 /// and TrueHD's pseudo-random number generation algorithm.
 pub fn dither_31eb(samples_per_au: usize, dither_seed: &mut u32) -> Vec<i32> {
-    let samples_per_au = samples_per_au.next_power_of_two();
-    let mut dither_table = Vec::with_capacity(samples_per_au);
+    let mut dither_table = vec![0; samples_per_au.next_power_of_two()];
 
-    for _ in 0..samples_per_au {
+    fill_dither_31eb(&mut dither_table, dither_seed);
+
+    dither_table
+}
+
+/// [`dither_31eb`] into a table that is already there, over its whole length.
+pub(crate) fn fill_dither_31eb(dither_table: &mut [i32], dither_seed: &mut u32) {
+    for dither in dither_table {
         let dither_seed_shr15 = *dither_seed >> 15;
-        dither_table.push(DITHER_LUT[dither_seed_shr15 as usize]);
+        *dither = DITHER_LUT[dither_seed_shr15 as usize];
         *dither_seed =
             ((*dither_seed << 8) ^ dither_seed_shr15 ^ (dither_seed_shr15 << 5)) & 0x7FFFFF;
     }
-
-    dither_table
 }
