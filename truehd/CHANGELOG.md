@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Parsing settles once per block which matrices of a substream with bypass counts bypass any bits, as it did for one with bypass flags, and the presentation that has an object substream takes 3 to 5% less time
 - `Extractor` copies an access unit once into the `Frame` it returns, instead of into a 64 KiB vector first and from there into the frame
 - On x86-64 processors with AVX2, a lossless matrix of five coefficients or more is applied eight channels to a multiplication. Decoding takes 1 to 5% less time, and 3 to 12% less for the presentation that has an object substream
+- Where the prediction filters run one channel at a time, which is on every processor but an x86-64 one with AVX2, each runs with the coefficients it has instead of twelve. Decoding takes 4 to 12% less time there
 - **BREAKING**: `structs::oamd` re-exports the [`oamd`](https://crates.io/crates/oamd) crate, which now owns these structures. Every type and function keeps the path it had, but `TEST_DATA` is `EXAMPLE_DATA` there and the other test payloads are no longer public
 
 ### Fixed

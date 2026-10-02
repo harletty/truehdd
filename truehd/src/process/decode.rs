@@ -600,7 +600,7 @@ impl DecoderState {
 
             let filter = |chi: usize| {
                 // Zero past each filter's order (an order of zero leaves stale
-                // coefficients behind), so both run at their full fixed length.
+                // coefficients behind), so both can run at their full fixed length.
                 let mut fir = [0i32; 8];
                 for (tap, fir) in fir.iter_mut().enumerate() {
                     if tap < order[0][chi] {
@@ -617,6 +617,7 @@ impl DecoderState {
                 Recorrelator {
                     fir,
                     iir,
+                    orders: (order[0][chi], order[1][chi]),
                     shift: coeff_q[0][chi],
                     mask: !((1 << quantiser_step_size[chi]) - 1),
                 }
@@ -971,6 +972,8 @@ impl DecoderState {
 struct Recorrelator {
     fir: [i32; 8],
     iir: [i32; 4],
+    /// How many coefficients each filter has. Those past them are zero.
+    orders: (usize, usize),
     shift: i32,
     mask: i64,
 }
@@ -990,6 +993,47 @@ fn recorrelate(
     chi: usize,
     wide: bool,
 ) -> Result<()> {
+    // One channel alone is held to its multiplications, one after the other,
+    // and most channels have fewer than the twelve of two full filters: the
+    // second filter is seldom there at all. An order past a filter's length
+    // runs it whole, zeros and all.
+    macro_rules! at_orders {
+        ($fir:literal) => {
+            match filter.orders.1 {
+                0 => recorrelate_at::<$fir, 0>(filter, history, block_data, rows, chi, wide),
+                1 => recorrelate_at::<$fir, 1>(filter, history, block_data, rows, chi, wide),
+                2 => recorrelate_at::<$fir, 2>(filter, history, block_data, rows, chi, wide),
+                3 => recorrelate_at::<$fir, 3>(filter, history, block_data, rows, chi, wide),
+                _ => recorrelate_at::<$fir, 4>(filter, history, block_data, rows, chi, wide),
+            }
+        };
+    }
+
+    match filter.orders.0 {
+        0 => at_orders!(0),
+        1 => at_orders!(1),
+        2 => at_orders!(2),
+        3 => at_orders!(3),
+        4 => at_orders!(4),
+        5 => at_orders!(5),
+        6 => at_orders!(6),
+        7 => at_orders!(7),
+        _ => at_orders!(8),
+    }
+}
+
+/// [`recorrelate`] with the first `FIR` and `IIR` coefficients of the filters,
+/// which is all of those that are not zero.
+fn recorrelate_at<const FIR: usize, const IIR: usize>(
+    filter: &Recorrelator,
+    history: [&mut [i32; 8]; 2],
+    block_data: &[[i32; 16]],
+    rows: &mut [[i32; 16]],
+    chi: usize,
+    wide: bool,
+) -> Result<()> {
+    let fir: &[i32; FIR] = filter.fir[..FIR].try_into().unwrap();
+    let iir: &[i32; IIR] = filter.iir[..IIR].try_into().unwrap();
     let (max_val, min_val) = if wide {
         (1i64 << 31, -(1i64 << 31))
     } else {
@@ -1006,8 +1050,8 @@ fn recorrelate(
         let audio_data = block_data[blki][chi] as i64;
         let state_base = STATE_BASE - blki;
 
-        let acc = dot_fixed(&filter.fir, &fir_states[state_base..])
-            + dot_fixed(&filter.iir, &iir_states[state_base..]);
+        let acc =
+            dot_fixed(fir, &fir_states[state_base..]) + dot_fixed(iir, &iir_states[state_base..]);
 
         let pred = acc >> filter.shift;
         let fir_state = audio_data + (pred & filter.mask);
@@ -1638,6 +1682,70 @@ mod tests {
         assert!(whole > 500 && upper > 500 && whole - upper > 100);
     }
 
+    /// Filters run at their orders leave the rows and the states that they leave
+    /// at full length, and report the same state out of its range.
+    #[test]
+    fn filters_at_their_orders_match_full_length() {
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut random = |bits: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed as i64 >> (64 - bits)) as i32
+        };
+        let (mut in_range, mut out_of_range) = (0, 0);
+
+        for round in 0..45 * 8usize {
+            let orders = (round % 9, round / 9 % 5);
+            let wide = round % 7 == 0;
+            let chi = round % 16;
+            let block_size = 8 + (random(16) as usize & 0xFFFF) % 153;
+            let residual_bits = if round % 11 == 0 { 24 } else { 16 };
+
+            let filter = Recorrelator {
+                fir: core::array::from_fn(|tap| if tap < orders.0 { random(11) } else { 0 }),
+                iir: core::array::from_fn(|tap| if tap < orders.1 { random(10) } else { 0 }),
+                orders,
+                shift: 8 + (random(4) & 7),
+                mask: !((1 << (random(3) & 3)) - 1),
+            };
+            let block_data: Vec<[i32; 16]> = (0..block_size)
+                .map(|_| core::array::from_fn(|_| random(residual_bits)))
+                .collect();
+            let history: [[i32; 8]; 2] =
+                core::array::from_fn(|_| core::array::from_fn(|_| random(20)));
+
+            let mut full_history = history;
+            let mut full_rows = vec![[0x5a5a5a5a; 16]; block_size];
+            let [fir, iir] = &mut full_history.each_mut();
+            let full =
+                recorrelate_at::<8, 4>(&filter, [fir, iir], &block_data, &mut full_rows, chi, wide);
+
+            let mut history = history;
+            let mut rows = vec![[0x5a5a5a5a; 16]; block_size];
+            let [fir, iir] = &mut history.each_mut();
+            let at_orders = recorrelate(&filter, [fir, iir], &block_data, &mut rows, chi, wide);
+
+            match (&at_orders, &full) {
+                (Ok(()), Ok(())) => {
+                    assert_eq!(rows, full_rows, "round {round}");
+                    assert_eq!(history, full_history, "round {round}");
+                    in_range += 1;
+                }
+                (Err(at_orders), Err(full)) => {
+                    assert_eq!(at_orders.to_string(), full.to_string(), "round {round}");
+                    out_of_range += 1;
+                }
+                _ => panic!("round {round}: {at_orders:?}, {full:?} at full length"),
+            }
+        }
+
+        assert!(
+            in_range > 100 && out_of_range > 10,
+            "{in_range} {out_of_range}"
+        );
+    }
+
     /// The lanes leave the rows and the filter states that one channel at a time
     /// leaves, and refuse the blocks in which a state leaves its range.
     #[test]
@@ -1664,12 +1772,27 @@ mod tests {
             // Mostly residuals a stable filter keeps in range, sometimes not.
             let residual_bits = if round % 7 == 0 { 24 } else { 16 };
 
+            // Filters of every length, one at a time at their orders and side by
+            // side at full length.
             let filters: Vec<Recorrelator> = (0..channels)
-                .map(|_| Recorrelator {
-                    fir: core::array::from_fn(|_| random(11)),
-                    iir: core::array::from_fn(|_| random(10)),
-                    shift: 8 + (random(4) & 7),
-                    mask: !((1 << (random(3) & 3)) - 1),
+                .map(|_| {
+                    let orders = ((random(5) & 15) as usize % 9, (random(4) & 7) as usize % 5);
+
+                    Recorrelator {
+                        fir: core::array::from_fn(
+                            |tap| {
+                                if tap < orders.0 { random(11) } else { 0 }
+                            },
+                        ),
+                        iir: core::array::from_fn(
+                            |tap| {
+                                if tap < orders.1 { random(10) } else { 0 }
+                            },
+                        ),
+                        orders,
+                        shift: 8 + (random(4) & 7),
+                        mask: !((1 << (random(3) & 3)) - 1),
+                    }
                 })
                 .collect();
             let block_data: Vec<[i32; 16]> = (0..block_size)
