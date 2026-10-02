@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AccessUnit::has_invalid_branch` and `DecoderState::has_invalid_branch` mark the access unit where the stream restarts at a branch the buffer-model conditions reject, the counterpart of `has_valid_branch` (#37)
 
 ### Changed
+- **BREAKING**: `DecoderSubstreamState` no longer has the `bypassed_lsb` and `block_data` fields, since the decoder now reads a block's samples from the `Block` itself. `Decoder::decode_presentation` builds its result directly instead of cloning it out of a boxed array of every presentation. Decoding takes about a fifth less time
 - **BREAKING**: `structs::oamd` re-exports the [`oamd`](https://crates.io/crates/oamd) crate, which now owns these structures. Every type and function keeps the path it had, but `TEST_DATA` is `EXAMPLE_DATA` there and the other test payloads are no longer public
 
 ### Fixed

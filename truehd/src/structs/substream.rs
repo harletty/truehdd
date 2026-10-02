@@ -170,7 +170,10 @@ impl SubstreamSegment {
                     reader
                 );
             }
-            ss.block.push(Block::read(state, reader)?);
+            // Built in place; a block that fails to read fails the whole segment.
+            ss.block.push(Block::default());
+            let block = ss.block.last_mut().expect("a block was just pushed");
+            block.read_into(state, reader)?;
             decoded += state.substream_state()?.restart.block_size;
             last_block_in_segment = reader.get()?;
             state.substream_state_mut()?.restart.block_index += 1;
