@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **BREAKING**: `DecoderSubstreamState` no longer has the `bypassed_lsb` and `block_data` fields, since the decoder now reads a block's samples from the `Block` itself. `Decoder::decode_presentation` builds its result directly instead of cloning it out of a boxed array of every presentation. Decoding takes about a fifth less time
 - **BREAKING**: `BsIoSliceReader` is now `SliceBitReader`, a reader over the slice itself, and its `get_n` and `get_s` take the `UnsignedBits` and `SignedBits` traits instead of `bitstream_io`'s; `diagnostic::bit_position` takes a `BsIoSliceReader`. Decoding takes about 40% less time. `BitstreamIoReader` is unchanged
+- Decoding runs the prediction filters and the lossless matrices at a length fixed at compile time, which takes 5 to 10% less time
 - **BREAKING**: `structs::oamd` re-exports the [`oamd`](https://crates.io/crates/oamd) crate, which now owns these structures. Every type and function keeps the path it had, but `TEST_DATA` is `EXAMPLE_DATA` there and the other test payloads are no longer public
 
 ### Fixed

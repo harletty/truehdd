@@ -437,7 +437,7 @@ impl Block {
 
             let huffman = Timer::start();
             // huff decode
-            for chi in min_chan..=max_chan {
+            for chi in min_chan..max_chan + 1 {
                 let huff_offset = huff_offset[chi];
                 let huff_type = huff_type[chi];
                 let huff_lsbs = huff_lsbs[chi];

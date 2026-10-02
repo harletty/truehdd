@@ -531,22 +531,19 @@ impl DecoderState {
                 let iir_order = order[1][chi];
                 let coeff_q_shift = coeff_q[0][chi];
                 let quantiser_mask = !((1 << quantiser_step_size[chi]) - 1);
-                let fir_coeff = &coeff[0][chi];
-                let iir_coeff = &coeff[1][chi];
+                // Zero past each filter's order (an order of zero leaves stale
+                // coefficients behind), so both run at their full fixed length.
+                let mut fir_coeff = [0i32; 8];
+                fir_coeff[..fir_order].copy_from_slice(&coeff[0][chi][..fir_order]);
+                let mut iir_coeff = [0i32; 4];
+                iir_coeff[..iir_order].copy_from_slice(&coeff[1][chi][..iir_order]);
 
                 for blki in 0..block_size {
                     let audio_data = block_data[blki][chi] as i64;
                     let state_base = 160 - blki;
 
-                    let mut acc = 0i64;
-
-                    for oi in 0..fir_order {
-                        acc += (fir_coeff[oi] as i64) * (state_buffer[0][state_base + oi] as i64);
-                    }
-
-                    for oi in 0..iir_order {
-                        acc += (iir_coeff[oi] as i64) * (state_buffer[1][state_base + oi] as i64);
-                    }
+                    let acc = dot_fixed(&fir_coeff, &state_buffer[0][state_base..])
+                        + dot_fixed(&iir_coeff, &state_buffer[1][state_base..]);
 
                     let pred = acc >> coeff_q_shift;
                     let fir_state = audio_data + (pred & quantiser_mask);
@@ -593,12 +590,12 @@ impl DecoderState {
                     let min_chan = self.substream_state[i].min_chan;
                     let max_chan = self.substream_state[i].max_chan;
 
-                    for blki in 0..block_size {
-                        for ch in min_chan..=max_chan {
-                            self.rematrix_buffer[decoded_sample_len + blki][ch] = self
-                                .substream_state[i]
-                                .rematrix_buffer[decoded_sample_len + blki][ch];
-                        }
+                    let rows = decoded_sample_len..decoded_sample_len + block_size;
+                    for (to, from) in self.rematrix_buffer[rows.clone()]
+                        .iter_mut()
+                        .zip(&self.substream_state[i].rematrix_buffer[rows])
+                    {
+                        to[min_chan..max_chan + 1].copy_from_slice(&from[min_chan..max_chan + 1]);
                     }
                 }
             }
@@ -607,6 +604,20 @@ impl DecoderState {
             let decoded_sample_len = &mut ss_state.decoded_sample_len;
             let dither_seed = &mut ss_state.dither_seed;
             let bypassed_lsb = &block.bypassed_lsb;
+            // Each matrix's coefficients, zero past the channels it combines, so that
+            // its product runs over a whole sample row at a fixed length.
+            let matrix_terms = if restart_sync_word == 0x31EA {
+                max_matrix_chan + 3
+            } else {
+                max_matrix_chan + 1
+            };
+            let mut m_masked = [[0i32; 16]; 16];
+            let mut delta_masked = [[0i32; 16]; 16];
+            for pmi in 0..primitive_matrices {
+                m_masked[pmi][..matrix_terms]
+                    .copy_from_slice(&ss_state.m_coeff[pmi][..matrix_terms]);
+                delta_masked[pmi][..matrix_terms].copy_from_slice(&delta_cf[pmi][..matrix_terms]);
+            }
             let m_coeff = &mut ss_state.m_coeff;
             let dither_table = &mut ss_state.dither_table;
             let rematrix_buffer = &mut self.rematrix_buffer[*decoded_sample_len..];
@@ -630,11 +641,8 @@ impl DecoderState {
                         for pmi in 0..primitive_matrices {
                             let mut acc = 0;
                             let matrix_ch = matrix_ch[pmi] as usize;
-                            let m_coeff = &m_coeff[pmi];
 
-                            for chi in 0..=max_matrix_chan + 2 {
-                                acc += rematrix_buffer[chi] as i64 * m_coeff[chi] as i64;
-                            }
+                            acc += dot_terms(&m_masked[pmi], rematrix_buffer, matrix_terms);
 
                             rematrix_buffer[matrix_ch] = (((acc >> 18) as i32)
                                 & (!((1 << quantiser_step_size[matrix_ch]) - 1)))
@@ -657,16 +665,13 @@ impl DecoderState {
 
                         for pmi in 0..primitive_matrices {
                             let mut acc = 0;
-                            let m_coeff = &m_coeff[pmi];
                             let dither_scale = dither_scale[pmi] as i64;
                             let matrix_ch = matrix_ch[pmi] as usize;
 
                             let dither_index =
                                 (primitive_matrices - pmi) * (2 * blki_abs + 1) + blki_abs;
 
-                            for chi in 0..=max_matrix_chan {
-                                acc += rematrix_buffer[chi] as i64 * m_coeff[chi] as i64;
-                            }
+                            acc += dot_terms(&m_masked[pmi], rematrix_buffer, matrix_terms);
 
                             if dither_scale != 0 {
                                 acc += (dither_table[dither_index & dither_index_mask] as i64)
@@ -699,16 +704,13 @@ impl DecoderState {
                             let mut acc_delta = 0;
                             let dither_scale = dither_scale[pmi] as u64;
                             let matrix_ch = matrix_ch[pmi] as usize;
-                            let m_coeff = &m_coeff[pmi];
-                            let delta_cf = &delta_cf[pmi];
 
                             let dither_index =
                                 (primitive_matrices - pmi) * (2 * blki_abs + 1) + blki_abs;
 
-                            for chi in 0..=max_matrix_chan {
-                                acc += rematrix_buffer[chi] as i64 * m_coeff[chi] as i64;
-                                acc_delta += rematrix_buffer[chi] as i64 * delta_cf[chi] as i64;
-                            }
+                            acc += dot_terms(&m_masked[pmi], rematrix_buffer, matrix_terms);
+                            acc_delta +=
+                                dot_terms(&delta_masked[pmi], rematrix_buffer, matrix_terms);
 
                             if dither_scale != 0 {
                                 acc += (dither_table[dither_index & dither_index_mask] as i64)
@@ -753,7 +755,7 @@ impl DecoderState {
                     let sample = rematrix_buffer[blki];
                     let mut output = [0; 16];
 
-                    for chi in 0..=max_matrix_chan {
+                    for chi in 0..max_matrix_chan + 1 {
                         let ch_assign = ch_assign[chi];
                         let output = &mut output[ch_assign];
 
@@ -847,5 +849,36 @@ impl DecoderState {
         };
 
         Ok(decoded)
+    }
+}
+
+/// Sum of the products of `a` with the first `N` values of `b`, in 64 bits. A
+/// length known at compile time unrolls into straight multiply-adds, where a
+/// run-time one pays a loop, or a vector loop's set-up, for a handful of terms.
+#[inline(always)]
+fn dot_fixed<const N: usize>(a: &[i32; N], b: &[i32]) -> i64 {
+    let b: &[i32; N] = b[..N].try_into().unwrap();
+    let mut acc = 0i64;
+    for i in 0..N {
+        acc += a[i] as i64 * b[i] as i64;
+    }
+    acc
+}
+
+/// [`dot_fixed`] over the first `terms` of a sample row, rounded up to a length
+/// unrolled at compile time: the coefficients past `terms` are zero, so the extra
+/// products add nothing. A 7.1 substream multiplies eight terms, not sixteen.
+#[inline(always)]
+fn dot_terms(coeff: &[i32; 16], row: &[i32; 16], terms: usize) -> i64 {
+    fn head<const N: usize>(coeff: &[i32; 16]) -> &[i32; N] {
+        coeff[..N].try_into().unwrap()
+    }
+    match terms {
+        0..=2 => dot_fixed(head::<2>(coeff), row),
+        3..=4 => dot_fixed(head::<4>(coeff), row),
+        5..=6 => dot_fixed(head::<6>(coeff), row),
+        7..=8 => dot_fixed(head::<8>(coeff), row),
+        9..=12 => dot_fixed(head::<12>(coeff), row),
+        _ => dot_fixed(coeff, row),
     }
 }
