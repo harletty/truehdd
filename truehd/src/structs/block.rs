@@ -44,27 +44,16 @@ pub struct BlockHeader {
 ///
 /// Contains 8-160 samples per channel with optional restart header,
 /// block header, and compressed audio data.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Block {
     pub restart_header: Option<RestartHeader>,
     pub block_header: Option<BlockHeader>,
     pub block_data_bits: Option<u16>,
-    pub bypassed_lsb: [[i32; 16]; 160],
-    pub block_data: [[i32; 16]; 160],
+    /// The bits each primitive matrix bypasses, one row per sample of the block.
+    pub bypassed_lsb: Vec<[u8; 16]>,
+    /// The residual of each channel, one row per sample of the block.
+    pub block_data: Vec<[i32; 16]>,
     pub block_header_crc: u8,
-}
-
-impl Default for Block {
-    fn default() -> Self {
-        Block {
-            restart_header: None,
-            block_header: None,
-            block_data_bits: None,
-            bypassed_lsb: [[0; 16]; 160],
-            block_data: [[0; 16]; 160],
-            block_header_crc: 0,
-        }
-    }
 }
 
 /// How a channel's samples are read through a block: the constants of the
@@ -242,9 +231,8 @@ impl Block {
         Ok(b)
     }
 
-    /// [`Block::read`] into a block that is already where it will live: a block is
-    /// 20 KiB of sample arrays, which `read` would move through its `Result` and into
-    /// the segment's `Vec` once more. `self` must be freshly defaulted.
+    /// [`Block::read`] into a block that is already where it will live. `self` must be
+    /// freshly defaulted.
     pub(crate) fn read_into(
         &mut self,
         state: &mut ParserState,
@@ -451,6 +439,9 @@ impl Block {
             }
         }
 
+        b.bypassed_lsb = vec![[0; 16]; block_size];
+        b.block_data = vec![[0; 16]; block_size];
+
         header_setup.record(&mut state.perf.block_header_setup);
 
         // What a sample of each channel takes to read, settled once for the block.
@@ -498,12 +489,12 @@ impl Block {
                     } else if lsb_bypass_bit_count <= 8
                         && let Some(bits) = window.take(lsb_bypass_bit_count)
                     {
-                        bits as i32
+                        bits as u8
                     } else {
                         reader.resume(&window);
                         let bits = reader.get_n::<u8>(lsb_bypass_bit_count)?;
                         window = reader.window();
-                        bits as i32
+                        bits
                     };
                     bypassed_lsb_bits += lsb_bypass_bit_count as u64;
                 }
@@ -511,12 +502,12 @@ impl Block {
                 // All of them out of one look at the stream.
                 if let Some(bits) = window.take(bypassing.len() as u32) {
                     for (read, &pmi) in bypassing.iter().enumerate() {
-                        bypassed_lsb_row[pmi] = ((bits >> (bypassing.len() - 1 - read)) & 1) as i32;
+                        bypassed_lsb_row[pmi] = ((bits >> (bypassing.len() - 1 - read)) & 1) as u8;
                     }
                 } else {
                     reader.resume(&window);
                     for &pmi in bypassing {
-                        bypassed_lsb_row[pmi] = reader.get_n::<u8>(1)? as i32;
+                        bypassed_lsb_row[pmi] = reader.get_n::<u8>(1)?;
                     }
                     window = reader.window();
                 }

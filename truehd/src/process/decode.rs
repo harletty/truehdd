@@ -524,6 +524,19 @@ impl DecoderState {
         let samples_per_au = self.samples_per_au;
         let current_substream_index = self.substream_index;
 
+        // A block holds the rows its own header announced. One read under another
+        // block size than the decoder is at reads as zeros past its last row.
+        let mut padded_data = None;
+        let block_data = match block.block_data.get(..block_size) {
+            Some(rows) => rows,
+            None => &padded_data.insert(padded_rows(&block.block_data))[..block_size],
+        };
+        let mut padded_lsb = None;
+        let bypassed_lsb = match block.bypassed_lsb.get(..block_size) {
+            Some(rows) => rows,
+            None => &padded_lsb.insert(padded_rows(&block.bypassed_lsb))[..block_size],
+        };
+
         // recorrelation
         {
             let ss_state = &mut self.substream_state[current_substream_index];
@@ -532,7 +545,6 @@ impl DecoderState {
             let coeff_state = &mut ss_state.coeff_state;
             let rows = &mut ss_state.rematrix_buffer[decoded_sample_len..][..block_size];
             let wide = restart_sync_word == 0x31EC;
-            let block_data = &block.block_data[..block_size];
 
             let filter = |chi: usize| {
                 // Zero past each filter's order (an order of zero leaves stale
@@ -622,7 +634,6 @@ impl DecoderState {
 
             let ss_state = &mut self.substream_state[current_substream_index];
             let rows = &mut self.rematrix_buffer[block_rows.clone()];
-            let bypassed_lsb = &block.bypassed_lsb[..block_size];
             let matrix_terms = if restart_sync_word == 0x31EA {
                 max_matrix_chan + 3
             } else {
@@ -1258,7 +1269,7 @@ impl MatrixTerms {
 fn apply_matrix<const N: usize>(
     terms: &MatrixTerms,
     rows: &mut [[i32; 16]],
-    bypassed_lsb: &[[i32; 16]],
+    bypassed_lsb: &[[u8; 16]],
     pmi: usize,
     dest: usize,
     mask: i32,
@@ -1281,8 +1292,18 @@ fn apply_matrix<const N: usize>(
 
         acc += extra(blki, acc_delta);
 
-        row[dest] = (((acc >> 18) as i32) & mask) + bypassed_lsb[pmi];
+        row[dest] = (((acc >> 18) as i32) & mask) + bypassed_lsb[pmi] as i32;
     }
+}
+
+/// The rows of a block followed by zeros, up to the longest block there is.
+#[cold]
+fn padded_rows<T: Copy + Default>(rows: &[[T; 16]]) -> Box<[[T; 16]; 160]> {
+    let mut padded = Box::new([[T::default(); 16]; 160]);
+    let len = rows.len().min(160);
+
+    padded[..len].copy_from_slice(&rows[..len]);
+    padded
 }
 
 #[cfg(test)]

@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Parsing builds a block and its header where they live instead of copying them there, and decoding takes 2 to 5% less time
 - Parsing reads a block's samples through a word it carries from one sample to the next, and decoding takes 11 to 17% less time
 - **BREAKING**: `DecoderState` has a private field, for the working states of the prediction filters, and can no longer be built from its fields. On x86-64 processors with AVX2 the filters of four channels run side by side, and decoding takes 4 to 16% less time
+- **BREAKING**: `Block::block_data` and `Block::bypassed_lsb` are vectors of one row per sample of the block instead of arrays of 160 rows, and the bypassed bits are `u8`. Index them as before, within the block. Decoding takes 2 to 8% less time
 - **BREAKING**: `structs::oamd` re-exports the [`oamd`](https://crates.io/crates/oamd) crate, which now owns these structures. Every type and function keeps the path it had, but `TEST_DATA` is `EXAMPLE_DATA` there and the other test payloads are no longer public
 
 ### Fixed
