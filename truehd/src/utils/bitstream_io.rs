@@ -52,7 +52,8 @@ pub struct BitstreamIoReader<R: io::Read + io::Seek> {
     len: u64,
 }
 
-pub type BsIoSliceReader<'a> = BitstreamIoReader<io::Cursor<&'a [u8]>>;
+/// The reader every parser in this crate reads with.
+pub type BsIoSliceReader<'a> = SliceBitReader<'a>;
 
 impl<R> BitstreamIoReader<R>
 where
@@ -366,17 +367,458 @@ where
     }
 }
 
-impl<'a> BsIoSliceReader<'a> {
-    pub fn from_slice(buf: &'a [u8]) -> Self {
-        let len = buf.len() as u64;
-        let read = io::Cursor::new(buf);
+/// Unsigned integers [`SliceBitReader::get_n`] reads into.
+pub trait UnsignedBits: Copy {
+    const BITS: u32;
+    fn from_bits(bits: u64) -> Self;
+}
 
-        Self::new(read, len)
+/// Signed integers [`SliceBitReader::get_s`] reads into.
+pub trait SignedBits: Copy {
+    const BITS: u32;
+    fn from_bits(bits: i64) -> Self;
+}
+
+macro_rules! impl_bits {
+    ($trait:ident, $wide:ty: $($t:ty),*) => {$(
+        impl $trait for $t {
+            const BITS: u32 = <$t>::BITS;
+            #[inline(always)]
+            fn from_bits(bits: $wide) -> Self {
+                bits as $t
+            }
+        }
+    )*};
+}
+
+impl_bits!(UnsignedBits, u64: u8, u16, u32, u64, usize);
+impl_bits!(SignedBits, i64: i8, i16, i32, i64);
+
+/// A Huffman table indexed by the next nine bits of the stream: the symbol those
+/// bits start with, and the length of its code.
+type HuffmanTable = [(i8, u8); 512];
+
+/// The three tables share one shape. A `1` starts the codes of the smallest
+/// symbols, followed by `small_bits` bits that are the symbol. A `0` starts the
+/// others: a sign bit, then up to five zeros closed by a `1`, the number of zeros
+/// giving the magnitude. Six zeros make the nine-bit deepest code, whose ninth bit
+/// the tables ignore (see [`HUFFMAN_DEEPEST_CODE`]). The test below holds these
+/// tables to the trees above, code for code.
+const fn huffman_table(positive_base: i8, small_bits: u32) -> HuffmanTable {
+    let mut table = [(0i8, 0u8); 512];
+    let mut code = 0;
+    while code < 512 {
+        let bits = code as u32;
+        table[code] = if bits & 0x100 != 0 {
+            let symbol = (bits >> (8 - small_bits)) & ((1 << small_bits) - 1);
+            (symbol as i8, 1 + small_bits as u8)
+        } else {
+            let rest = bits & 0x7F;
+            let zeros = if rest == 0 {
+                7
+            } else {
+                rest.leading_zeros() - 25
+            };
+            let zeros = if zeros > 6 { 6 } else { zeros };
+            let length = if zeros == 6 { 9 } else { 3 + zeros as u8 };
+            let symbol = if bits & 0x80 != 0 {
+                positive_base + zeros as i8
+            } else {
+                -1 - zeros as i8
+            };
+            (symbol, length)
+        };
+        code += 1;
+    }
+    table
+}
+
+static HUFFMAN_TABLE_1: HuffmanTable = huffman_table(4, 2);
+static HUFFMAN_TABLE_2: HuffmanTable = huffman_table(2, 1);
+static HUFFMAN_TABLE_3: HuffmanTable = huffman_table(1, 0);
+
+/// A bit reader over a byte slice, most significant bit first.
+///
+/// It reads up to 57 bits with one unaligned big-endian load, where a reader over
+/// [`io::Read`] refills bit by bit, and decodes a Huffman code with one table
+/// lookup instead of walking a tree. Reads past the end fail with
+/// [`io::ErrorKind::UnexpectedEof`], as they did through [`BitstreamIoReader`].
+#[derive(Debug, Default, Clone)]
+pub struct SliceBitReader<'a> {
+    data: &'a [u8],
+    /// Position, in bits from the start of `data`.
+    pos: u64,
+    /// Length of `data`, in bits.
+    len: u64,
+}
+
+impl<'a> SliceBitReader<'a> {
+    pub fn from_slice(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            pos: 0,
+            len: (data.len() as u64) << 3,
+        }
+    }
+
+    /// The bits from `pos` on, in the high bits of the word: at least 57 valid,
+    /// zeros past the end of the data.
+    #[inline(always)]
+    fn peek_at(&self, pos: u64) -> u64 {
+        let byte = (pos >> 3) as usize;
+        let word = match self.data.get(byte..byte + 8) {
+            Some(bytes) => u64::from_be_bytes(bytes.try_into().unwrap()),
+            None => {
+                let mut buf = [0u8; 8];
+                if let Some(tail) = self.data.get(byte..) {
+                    buf[..tail.len()].copy_from_slice(tail);
+                }
+                u64::from_be_bytes(buf)
+            }
+        };
+        word << (pos & 7)
+    }
+
+    #[cold]
+    fn out_of_bounds(&self, what: &str, n: u64) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("{what}({n}): out of bounds bits at {}", self.pos),
+        )
+    }
+
+    #[cold]
+    fn too_wide(what: &str, n: u32) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{what}({n}): excessive bits for type read"),
+        )
+    }
+
+    /// The next `n` bits (at most 64), as the low bits of the result.
+    #[inline(always)]
+    fn read_bits(&mut self, n: u32, what: &str) -> io::Result<u64> {
+        if self.pos + n as u64 > self.len {
+            return Err(self.out_of_bounds(what, n as u64));
+        }
+        let bits = if n == 0 {
+            0
+        } else if n <= 57 {
+            self.peek_at(self.pos) >> (64 - n)
+        } else {
+            let high = self.peek_at(self.pos) >> 32;
+            let low = self.peek_at(self.pos + 32) >> (96 - n);
+            (high << (n - 32)) | low
+        };
+        self.pos += n as u64;
+        Ok(bits)
+    }
+
+    #[inline(always)]
+    pub fn get(&mut self) -> io::Result<bool> {
+        self.read_bits(1, "get").map(|bit| bit != 0)
+    }
+
+    #[inline(always)]
+    pub fn get_n<I: UnsignedBits>(&mut self, n: u32) -> io::Result<I> {
+        if n > I::BITS {
+            return Err(Self::too_wide("get_n", n));
+        }
+        self.read_bits(n, "get_n").map(I::from_bits)
+    }
+
+    #[inline(always)]
+    pub fn get_s<S: SignedBits>(&mut self, n: u32) -> io::Result<S> {
+        if n == 0 || n > S::BITS {
+            return Err(Self::too_wide("get_s", n));
+        }
+        let bits = self.read_bits(n, "get_s")?;
+        let shift = 64 - n;
+        Ok(S::from_bits(((bits << shift) as i64) >> shift))
+    }
+
+    #[inline(always)]
+    pub fn get_huffman(&mut self, huff_type: usize) -> io::Result<i32> {
+        let table = match huff_type {
+            1 => &HUFFMAN_TABLE_1,
+            2 => &HUFFMAN_TABLE_2,
+            3 => &HUFFMAN_TABLE_3,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "get_huffman: unsupported huff_type",
+                ));
+            }
+        };
+        let (symbol, length) = table[(self.peek_at(self.pos) >> 55) as usize];
+        if self.pos + length as u64 > self.len {
+            return Err(self.out_of_bounds("get_huffman", length as u64));
+        }
+        self.pos += length as u64;
+        Ok(symbol as i32)
+    }
+
+    #[inline(always)]
+    pub fn get_variable_bits_max(&mut self, n: u32, max_num_groups: u32) -> io::Result<u32> {
+        let mut value = 0;
+        let mut num_group = 0;
+        let mut b_read_more = true;
+
+        while b_read_more && num_group < max_num_groups {
+            let read = self.get_n::<u32>(n)?;
+            value += read;
+            b_read_more = self.get()?;
+            if b_read_more {
+                value = (value + 1) << n;
+                num_group += 1;
+            }
+        }
+
+        Ok(value)
+    }
+
+    #[inline(always)]
+    pub fn seek(&mut self, offset: i64) -> io::Result<u64> {
+        if (offset < 0 && self.pos as i64 + offset >= 0)
+            || (offset >= 0 && (self.len - self.pos) as i64 >= offset)
+        {
+            self.pos = (self.pos as i64 + offset) as u64;
+            return Ok(self.pos);
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("seek({offset}): out of bounds bits at {}", self.pos),
+        ))
+    }
+
+    /// The bytes of `len` bits from `start`, the first `len >> 3` of them handed to
+    /// `f` as one slice: borrowed when `start` is byte aligned, gathered otherwise.
+    fn with_bytes<T>(&self, start: u64, len: u64, f: impl FnOnce(&[u8]) -> T) -> T {
+        let bytes_len = (len >> 3) as usize;
+        if start & 7 == 0 {
+            let first = (start >> 3) as usize;
+            return f(&self.data[first..first + bytes_len]);
+        }
+        let gather = |buf: &mut [u8]| {
+            for (i, byte) in buf.iter_mut().enumerate() {
+                *byte = (self.peek_at(start + 8 * i as u64) >> 56) as u8;
+            }
+        };
+        if bytes_len <= STACK_BUF_SIZE {
+            let mut stack_buf = [0u8; STACK_BUF_SIZE];
+            let buf = &mut stack_buf[..bytes_len];
+            gather(buf);
+            f(buf)
+        } else {
+            let mut heap_buf = vec![0; bytes_len];
+            gather(&mut heap_buf);
+            f(&heap_buf)
+        }
+    }
+
+    #[inline(always)]
+    // TODO: byte boundary
+    pub fn parity_check_for_last_n_bits(&mut self, len: u64) -> io::Result<u8> {
+        if len > self.pos {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("seek(-{len}): out of bounds bits at {}", self.pos),
+            ));
+        }
+
+        Ok(self.with_bytes(self.pos - len, len, |buf| {
+            buf.iter().fold(0, |acc, x| acc ^ x)
+        }))
+    }
+
+    #[inline(always)]
+    pub fn parity_check_nibble_for_last_n_bits(&mut self, len: u64) -> io::Result<u8> {
+        let mut parity = self.parity_check_for_last_n_bits(len)?;
+
+        parity ^= parity >> 4;
+        parity &= 0xF;
+
+        Ok(parity)
+    }
+
+    /// The `n` bits at `at`, which the caller has checked lie within the data.
+    #[inline(always)]
+    fn bits_at(&self, at: u64, n: u64) -> u64 {
+        self.peek_at(at) >> (64 - n)
+    }
+
+    #[inline(always)]
+    pub fn crc8_check(&mut self, crc: &Crc8, start: u64, len: u64) -> io::Result<u8> {
+        if start + len > self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "crc8_check: out of bounds bits",
+            ));
+        }
+
+        let mut checksum = crc.init;
+
+        let prefix_len = start & 7;
+        let suffix_len = (len - prefix_len) & 7;
+        let middle_len = len - prefix_len - suffix_len;
+
+        if prefix_len != 0 {
+            let prefix = self.bits_at(start, prefix_len) as u8;
+            checksum = crc8(crc.poly, checksum, prefix_len as usize) ^ prefix;
+        }
+
+        let middle_start = start + prefix_len;
+        checksum = self.with_bytes(middle_start, middle_len, |buf| crc.update(checksum, buf));
+
+        if suffix_len != 0 {
+            let suffix = self.bits_at(middle_start + middle_len, suffix_len) as u8;
+            checksum = crc8(crc.poly, checksum, suffix_len as usize) ^ suffix;
+        }
+
+        Ok(checksum)
+    }
+
+    #[inline(always)]
+    pub fn crc16_check(&mut self, crc: &Crc16, start: u64, len: u64) -> io::Result<u16> {
+        if start + len > self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "crc8_check: out of bounds bits",
+            ));
+        }
+
+        let mut checksum = crc.init;
+
+        let prefix_len = start & 7;
+        let suffix_len = (len - prefix_len) & 7;
+        let middle_len = len - prefix_len - suffix_len;
+
+        if prefix_len != 0 {
+            let prefix = self.bits_at(start, prefix_len) as u16;
+            checksum = crc16(crc.poly, checksum, prefix_len as usize) ^ prefix;
+        }
+
+        let middle_start = start + prefix_len;
+        checksum = self.with_bytes(middle_start, middle_len, |buf| crc.update(checksum, buf));
+
+        if suffix_len != 0 {
+            let suffix = self.bits_at(middle_start + middle_len, suffix_len) as u16;
+            checksum = crc16(crc.poly, checksum, suffix_len as usize) ^ suffix;
+        }
+
+        Ok(checksum)
+    }
+
+    #[inline(always)]
+    pub fn align_16bit(&mut self) -> io::Result<()> {
+        self.pos = (self.pos + 7) & !7;
+
+        if self.pos & 15 > 0 {
+            self.skip_n(8)?;
+        }
+
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub fn available(&mut self) -> io::Result<u64> {
+        Ok(self.len - self.pos)
+    }
+
+    #[inline(always)]
+    pub fn skip_n(&mut self, n: u32) -> io::Result<()> {
+        if self.pos + n as u64 > self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "skip_n: out of bounds bits",
+            ));
+        }
+        self.pos += n as u64;
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub fn position(&mut self) -> io::Result<u64> {
+        Ok(self.pos)
     }
 }
 
-impl Default for BsIoSliceReader<'_> {
-    fn default() -> Self {
-        Self::from_slice(&[])
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every nine-bit pattern decodes through the table to the symbol and code
+    /// length the trees give it.
+    #[test]
+    fn huffman_tables_match_the_trees() {
+        fn tree<T: bitstream_io::huffman::FromBits<Symbol = i32>>(code: u16) -> (i32, u64) {
+            let bytes = (code << 7).to_be_bytes();
+            let mut reader = BitReader::endian(io::Cursor::new(&bytes[..]), BigEndian);
+            let symbol = reader.read_huffman::<T>().unwrap();
+            (symbol, reader.position_in_bits().unwrap())
+        }
+
+        for code in 0..512u16 {
+            let bytes = (code << 7).to_be_bytes();
+            for (huff_type, expected) in [
+                (1, tree::<HuffTree1>(code)),
+                (2, tree::<HuffTree2>(code)),
+                (3, tree::<HuffTree3>(code)),
+            ] {
+                let mut reader = SliceBitReader::from_slice(&bytes);
+                let symbol = reader.get_huffman(huff_type).unwrap();
+                assert_eq!(
+                    (symbol, reader.position().unwrap()),
+                    expected,
+                    "table {huff_type}, code {code:09b}"
+                );
+            }
+        }
+    }
+
+    /// Reads of every width at every bit offset agree with `bitstream_io`.
+    #[test]
+    fn reads_match_bitstream_io() {
+        let data: Vec<u8> = (0..64u32)
+            .map(|i| (i.wrapping_mul(0x9E) ^ 0x5A) as u8)
+            .collect();
+        for start in 0..16u32 {
+            for n in 1..=64u32 {
+                let mut ours = SliceBitReader::from_slice(&data);
+                let mut theirs =
+                    BitstreamIoReader::new(io::Cursor::new(&data[..]), data.len() as u64);
+                ours.skip_n(start).unwrap();
+                theirs.skip_n(start).unwrap();
+                assert_eq!(
+                    ours.get_n::<u64>(n).unwrap(),
+                    theirs.get_n::<u64>(n).unwrap(),
+                    "u{n} at {start}"
+                );
+                if n <= 32 {
+                    assert_eq!(
+                        ours.get_s::<i32>(n).unwrap(),
+                        theirs.get_s::<i32>(n).unwrap(),
+                        "i{n} at {}",
+                        start + n
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reading_past_the_end_fails() {
+        let mut reader = SliceBitReader::from_slice(&[0xFF]);
+        assert_eq!(reader.get_n::<u8>(7).unwrap(), 0x7F);
+        assert_eq!(
+            reader.get_n::<u8>(2).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert!(reader.get().unwrap());
+        assert_eq!(
+            reader.get_huffman(3).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 }
