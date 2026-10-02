@@ -302,6 +302,10 @@ pub struct DecoderState {
     pub zero_samples: usize,
     pub oamd: VecDeque<ObjectAudioMetadataPayload>,
     pub substream_info_changed: bool,
+
+    /// Where the filters of a block keep their states while it is decoded. Nothing
+    /// in it outlives the block.
+    recorrelator_states: Box<[LaneStates; STATE_BASE + 8]>,
 }
 
 impl Default for DecoderState {
@@ -331,6 +335,7 @@ impl Default for DecoderState {
             zero_samples: 0,
             oamd: VecDeque::with_capacity(4),
             substream_info_changed: false,
+            recorrelator_states: Box::new([[[0; LANES]; 2]; STATE_BASE + 8]),
         }
     }
 }
@@ -512,7 +517,6 @@ impl DecoderState {
             quantiser_step_size,
 
             order,
-            coeff,
             coeff_q,
             ..
         } = *self.substream_state()?;
@@ -520,76 +524,70 @@ impl DecoderState {
         let samples_per_au = self.samples_per_au;
         let current_substream_index = self.substream_index;
 
-        let (max_val, min_val) = if restart_sync_word == 0x31EC {
-            (1 << 31, -(1 << 31))
-        } else {
-            (1 << 23, -(1 << 23))
-        };
-
         // recorrelation
         {
             let ss_state = &mut self.substream_state[current_substream_index];
             let decoded_sample_len = ss_state.decoded_sample_len;
+            let coeff = &ss_state.coeff;
             let coeff_state = &mut ss_state.coeff_state;
-            let rematrix_buffer = &mut ss_state.rematrix_buffer[decoded_sample_len..];
-            let block_data = &block.block_data;
+            let rows = &mut ss_state.rematrix_buffer[decoded_sample_len..][..block_size];
+            let wide = restart_sync_word == 0x31EC;
+            let block_data = &block.block_data[..block_size];
 
-            // Shared by the channels: each one reads only what it wrote itself or
-            // loaded from its coefficient state, so it needs no clearing in between.
-            let mut state_buffer = [[0; 168]; 2];
-
-            #[allow(clippy::needless_range_loop)]
-            for chi in min_chan..=max_chan {
-                state_buffer[0][160..].copy_from_slice(&coeff_state[0][chi]);
-                state_buffer[1][160..].copy_from_slice(&coeff_state[1][chi]);
-
-                let fir_order = order[0][chi];
-                let iir_order = order[1][chi];
-                let coeff_q_shift = coeff_q[0][chi];
-                let quantiser_mask = !((1 << quantiser_step_size[chi]) - 1);
-                let fir_coeff = &coeff[0][chi];
-                let iir_coeff = &coeff[1][chi];
-
-                for blki in 0..block_size {
-                    let audio_data = block_data[blki][chi] as i64;
-                    let state_base = 160 - blki;
-
-                    let mut acc = 0i64;
-
-                    for oi in 0..fir_order {
-                        acc += (fir_coeff[oi] as i64) * (state_buffer[0][state_base + oi] as i64);
+            let filter = |chi: usize| {
+                // Zero past each filter's order (an order of zero leaves stale
+                // coefficients behind), so both run at their full fixed length.
+                let mut fir = [0i32; 8];
+                for (tap, fir) in fir.iter_mut().enumerate() {
+                    if tap < order[0][chi] {
+                        *fir = coeff[0][chi][tap];
                     }
-
-                    for oi in 0..iir_order {
-                        acc += (iir_coeff[oi] as i64) * (state_buffer[1][state_base + oi] as i64);
+                }
+                let mut iir = [0i32; 4];
+                for (tap, iir) in iir.iter_mut().enumerate() {
+                    if tap < order[1][chi] {
+                        *iir = coeff[1][chi][tap];
                     }
-
-                    let pred = acc >> coeff_q_shift;
-                    let fir_state = audio_data + (pred & quantiser_mask);
-                    let iir_state = fir_state - pred;
-
-                    if fir_state >= max_val {
-                        bail!(DecodeError::RecorrelatorPositiveSaturation(fir_state));
-                    } else if fir_state < min_val {
-                        bail!(DecodeError::RecorrelatorNegativeSaturation(fir_state));
-                    }
-
-                    if !(min_val..max_val).contains(&iir_state) {
-                        if restart_sync_word == 0x31EC {
-                            bail!(DecodeError::FilterBInputTooWide32(iir_state));
-                        } else {
-                            bail!(DecodeError::FilterBInputTooWide24(iir_state));
-                        }
-                    }
-
-                    state_buffer[0][159 - blki] = fir_state as i32;
-                    state_buffer[1][159 - blki] = iir_state as i32;
-
-                    rematrix_buffer[blki][chi] = fir_state as i32;
                 }
 
-                coeff_state[0][chi][..].copy_from_slice(&state_buffer[0][160 - block_size..][..8]);
-                coeff_state[1][chi][..].copy_from_slice(&state_buffer[1][160 - block_size..][..8]);
+                Recorrelator {
+                    fir,
+                    iir,
+                    shift: coeff_q[0][chi],
+                    mask: !((1 << quantiser_step_size[chi]) - 1),
+                }
+            };
+
+            let lanes = lanes_available();
+            let mut chi = min_chan;
+
+            while chi <= max_chan {
+                if lanes {
+                    let channels = (max_chan + 1 - chi).min(LANES);
+                    let mut filters = [Recorrelator::default(); LANES];
+                    for (lane, lane_filter) in filters[..channels].iter_mut().enumerate() {
+                        *lane_filter = filter(chi + lane);
+                    }
+
+                    if recorrelate_lanes(
+                        &filters[..channels],
+                        coeff_state,
+                        &mut self.recorrelator_states,
+                        block_data,
+                        rows,
+                        chi,
+                        wide,
+                    ) {
+                        chi += channels;
+                        continue;
+                    }
+                }
+
+                // Where the lanes are not to be had, or to find which channel of
+                // them left its range, and at which sample.
+                let [fir, iir] = &mut coeff_state.each_mut().map(|state| &mut state[chi]);
+                recorrelate(&filter(chi), [fir, iir], block_data, rows, chi, wide)?;
+                chi += 1;
             }
         }
 
@@ -892,6 +890,328 @@ impl DecoderState {
     }
 }
 
+/// One channel's prediction filters, as a block runs them.
+#[derive(Clone, Copy, Default)]
+struct Recorrelator {
+    fir: [i32; 8],
+    iir: [i32; 4],
+    shift: i32,
+    mask: i64,
+}
+
+/// The longest block, which is how far back a filter's states are kept while one
+/// is decoded: newest first, the block's own below the eight it started with.
+const STATE_BASE: usize = 160;
+
+/// Run one channel's filters over a block, from the residuals in `block_data` to
+/// the samples in `rows`. `history` holds the last eight states of each filter,
+/// newest first, and is brought up to date.
+fn recorrelate(
+    filter: &Recorrelator,
+    history: [&mut [i32; 8]; 2],
+    block_data: &[[i32; 16]],
+    rows: &mut [[i32; 16]],
+    chi: usize,
+    wide: bool,
+) -> Result<()> {
+    let (max_val, min_val) = if wide {
+        (1i64 << 31, -(1i64 << 31))
+    } else {
+        (1i64 << 23, -(1i64 << 23))
+    };
+    let block_size = block_data.len().min(STATE_BASE);
+    let mut fir_states = [0; STATE_BASE + 8];
+    let mut iir_states = [0; STATE_BASE + 8];
+
+    fir_states[STATE_BASE..].copy_from_slice(history[0]);
+    iir_states[STATE_BASE..].copy_from_slice(history[1]);
+
+    for blki in 0..block_size {
+        let audio_data = block_data[blki][chi] as i64;
+        let state_base = STATE_BASE - blki;
+
+        let acc = dot_fixed(&filter.fir, &fir_states[state_base..])
+            + dot_fixed(&filter.iir, &iir_states[state_base..]);
+
+        let pred = acc >> filter.shift;
+        let fir_state = audio_data + (pred & filter.mask);
+        let iir_state = fir_state - pred;
+
+        if fir_state >= max_val {
+            bail!(DecodeError::RecorrelatorPositiveSaturation(fir_state));
+        } else if fir_state < min_val {
+            bail!(DecodeError::RecorrelatorNegativeSaturation(fir_state));
+        }
+
+        if !(min_val..max_val).contains(&iir_state) {
+            if wide {
+                bail!(DecodeError::FilterBInputTooWide32(iir_state));
+            } else {
+                bail!(DecodeError::FilterBInputTooWide24(iir_state));
+            }
+        }
+
+        fir_states[state_base - 1] = fir_state as i32;
+        iir_states[state_base - 1] = iir_state as i32;
+
+        rows[blki][chi] = fir_state as i32;
+    }
+
+    history[0].copy_from_slice(&fir_states[STATE_BASE - block_size..][..8]);
+    history[1].copy_from_slice(&iir_states[STATE_BASE - block_size..][..8]);
+
+    Ok(())
+}
+
+/// How many channels [`recorrelate_lanes`] runs side by side.
+const LANES: usize = 4;
+
+/// The states of both filters of every lane at one sample.
+type LaneStates = [[i64; LANES]; 2];
+
+/// Whether [`recorrelate_lanes`] can run on this processor.
+fn lanes_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// [`recorrelate`] for the channels `chi..chi + filters.len()`, at most [`LANES`]
+/// of them, side by side. `false` where the processor cannot, and where a state
+/// of any of them left its range: the rows are then not to be used, and the
+/// caller runs the channels one at a time, which reports the first.
+///
+/// One channel alone is held to twelve multiplications a sample, one after the
+/// other. Side by side, each multiplication is one instruction for all the lanes.
+#[allow(unused_variables)]
+fn recorrelate_lanes(
+    filters: &[Recorrelator],
+    coeff_state: &mut [[[i32; 8]; 16]; 2],
+    states: &mut [LaneStates; STATE_BASE + 8],
+    block_data: &[[i32; 16]],
+    rows: &mut [[i32; 16]],
+    chi: usize,
+    wide: bool,
+) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the processor has AVX2, which is all the function requires.
+        return unsafe {
+            avx2::recorrelate_lanes(filters, coeff_state, states, block_data, rows, chi, wide)
+        };
+    }
+
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use super::{LANES, LaneStates, Recorrelator, STATE_BASE};
+    use std::arch::x86_64::*;
+
+    #[inline(always)]
+    fn load(lanes: &[i64; LANES]) -> __m256i {
+        // SAFETY: an array of four `i64` is 32 readable bytes.
+        unsafe { _mm256_loadu_si256(lanes.as_ptr().cast()) }
+    }
+
+    #[inline(always)]
+    fn store(lanes: &mut [i64; LANES], value: __m256i) {
+        // SAFETY: an array of four `i64` is 32 writable bytes.
+        unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast(), value) }
+    }
+
+    #[inline(always)]
+    fn load_half(lanes: &[i32; LANES]) -> __m128i {
+        // SAFETY: an array of four `i32` is 16 readable bytes.
+        unsafe { _mm_loadu_si128(lanes.as_ptr().cast()) }
+    }
+
+    #[inline(always)]
+    fn store_half(lanes: &mut [i32; LANES], value: __m128i) {
+        // SAFETY: an array of four `i32` is 16 writable bytes.
+        unsafe { _mm_storeu_si128(lanes.as_mut_ptr().cast(), value) }
+    }
+
+    /// See [`super::recorrelate_lanes`]. Lane `l` is channel `first + l`, where
+    /// `first` is `chi` unless that would run past the sixteenth channel. A lane
+    /// outside `chi..chi + filters.len()` has zero coefficients and takes zero
+    /// residuals, so its states stay zero, and it leaves its channel alone.
+    #[target_feature(enable = "avx2")]
+    pub(super) fn recorrelate_lanes(
+        filters: &[Recorrelator],
+        coeff_state: &mut [[[i32; 8]; 16]; 2],
+        states: &mut [LaneStates; STATE_BASE + 8],
+        block_data: &[[i32; 16]],
+        rows: &mut [[i32; 16]],
+        chi: usize,
+        wide: bool,
+    ) -> bool {
+        let block_size = block_data.len().min(rows.len()).min(STATE_BASE);
+        let first = chi.min(16 - LANES);
+        let lane_of = |channel: usize| channel - first;
+
+        if chi + filters.len() > first + LANES {
+            return false;
+        }
+
+        let mut fir = [[0i64; LANES]; 8];
+        let mut iir = [[0i64; LANES]; 4];
+        let mut shift = [0i64; LANES];
+        let mut mask = [0i64; LANES];
+        let mut live = [0i32; LANES];
+
+        for (channel, filter) in (chi..).zip(filters) {
+            let lane = lane_of(channel);
+
+            for (tap, coeff) in filter.fir.iter().enumerate() {
+                fir[tap][lane] = *coeff as i64;
+            }
+            for (tap, coeff) in filter.iir.iter().enumerate() {
+                iir[tap][lane] = *coeff as i64;
+            }
+            // As a scalar shift takes its count.
+            shift[lane] = (filter.shift & 63) as i64;
+            mask[lane] = filter.mask;
+            live[lane] = -1;
+        }
+
+        for (tap, states) in states[STATE_BASE..].iter_mut().enumerate() {
+            *states = [[0; LANES]; 2];
+
+            for channel in chi..chi + filters.len() {
+                states[0][lane_of(channel)] = coeff_state[0][channel][tap] as i64;
+                states[1][lane_of(channel)] = coeff_state[1][channel][tap] as i64;
+            }
+        }
+
+        let mut fir_lanes = [_mm256_setzero_si256(); 8];
+        for (lanes, coeff) in fir_lanes.iter_mut().zip(&fir) {
+            *lanes = load(coeff);
+        }
+        let mut iir_lanes = [_mm256_setzero_si256(); 4];
+        for (lanes, coeff) in iir_lanes.iter_mut().zip(&iir) {
+            *lanes = load(coeff);
+        }
+        let (fir, iir) = (fir_lanes, iir_lanes);
+        // The count is below 64, which the shift has no way to know.
+        let shift = _mm256_and_si256(load(&shift), _mm256_set1_epi64x(63));
+        let mask = load(&mask);
+        let live_half = load_half(&live);
+        let live = _mm256_cvtepi32_epi64(live_half);
+        // An arithmetic shift is a logical one of the value moved up by 2^63,
+        // moved back down by 2^63 shifted as much. The sum of the older
+        // products, which is ready early, carries the move up.
+        let sign = _mm256_set1_epi64x(i64::MIN);
+        let shifted_sign = _mm256_srlv_epi64(sign, shift);
+        // A state in range, moved up by half the range, has no bit at or above
+        // the width of the range.
+        let (bias, bits) = if wide {
+            (1i64 << 31, 32)
+        } else {
+            (1i64 << 23, 24)
+        };
+        let bias = _mm256_set1_epi64x(bias);
+        let bits = _mm_cvtsi32_si128(bits);
+        // The low halves of the four lanes, side by side.
+        let low_halves = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+
+        // The products of every state but the newest, oldest first: each sample
+        // has them ready for the next one, so that all that waits on a sample
+        // is its own two products.
+        let older_products = |window: &[LaneStates]| -> __m256i {
+            let window: &[LaneStates; 8] = window[..8].try_into().expect("eight states");
+            let mut acc = sign;
+
+            for tap in (1..8).rev() {
+                acc = _mm256_add_epi64(acc, _mm256_mul_epi32(fir[tap], load(&window[tap][0])));
+            }
+            for tap in (1..4).rev() {
+                acc = _mm256_add_epi64(acc, _mm256_mul_epi32(iir[tap], load(&window[tap][1])));
+            }
+
+            acc
+        };
+
+        let mut older = older_products(&states[STATE_BASE..]);
+        let mut newest_fir = load(&states[STATE_BASE][0]);
+        let mut newest_iir = load(&states[STATE_BASE][1]);
+        let mut out_of_range = _mm256_setzero_si256();
+
+        for blki in 0..block_size {
+            let state_base = STATE_BASE - blki;
+            let data: &[i32; LANES] = block_data[blki][first..first + LANES]
+                .try_into()
+                .expect("four channels");
+            let row: &mut [i32; LANES] = (&mut rows[blki][first..first + LANES])
+                .try_into()
+                .expect("four channels");
+
+            let acc = _mm256_add_epi64(
+                _mm256_add_epi64(older, _mm256_mul_epi32(fir[0], newest_fir)),
+                _mm256_mul_epi32(iir[0], newest_iir),
+            );
+            let pred = _mm256_sub_epi64(_mm256_srlv_epi64(acc, shift), shifted_sign);
+            let residual = _mm256_and_si256(_mm256_cvtepi32_epi64(load_half(data)), live);
+            let fir_state = _mm256_add_epi64(residual, _mm256_and_si256(pred, mask));
+            let iir_state = _mm256_sub_epi64(fir_state, pred);
+
+            out_of_range = _mm256_or_si256(
+                out_of_range,
+                _mm256_srl_epi64(
+                    _mm256_or_si256(
+                        _mm256_add_epi64(fir_state, bias),
+                        _mm256_add_epi64(iir_state, bias),
+                    ),
+                    bits,
+                ),
+            );
+
+            store(&mut states[state_base - 1][0], fir_state);
+            store(&mut states[state_base - 1][1], iir_state);
+
+            let samples =
+                _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(fir_state, low_halves));
+            store_half(row, _mm_blendv_epi8(load_half(row), samples, live_half));
+
+            older = older_products(&states[state_base - 1..]);
+            newest_fir = fir_state;
+            newest_iir = iir_state;
+        }
+
+        if _mm256_testz_si256(out_of_range, out_of_range) == 0 {
+            return false;
+        }
+
+        for (tap, states) in states[STATE_BASE - block_size..][..8].iter().enumerate() {
+            for channel in chi..chi + filters.len() {
+                coeff_state[0][channel][tap] = states[0][lane_of(channel)] as i32;
+                coeff_state[1][channel][tap] = states[1][lane_of(channel)] as i32;
+            }
+        }
+
+        true
+    }
+}
+
+/// Sum of the products of `a` with the first `N` values of `b`, in 64 bits. A
+/// length known at compile time unrolls into straight multiply-adds, where a
+/// run-time one pays a loop, or a vector loop's set-up, for a handful of terms.
+#[inline(always)]
+fn dot_fixed<const N: usize>(a: &[i32; N], b: &[i32]) -> i64 {
+    let b: &[i32; N] = b[..N].try_into().unwrap();
+    let mut acc = 0i64;
+    for i in 0..N {
+        acc += a[i] as i64 * b[i] as i64;
+    }
+    acc
+}
+
 /// The products of one primitive matrix that are not zero: which channels of the
 /// sample row it reads, and with which coefficients. A matrix of a 7.1 substream
 /// often reads half of the eight channels, and one that only rescales a channel
@@ -962,5 +1282,87 @@ fn apply_matrix<const N: usize>(
         acc += extra(blki, acc_delta);
 
         row[dest] = (((acc >> 18) as i32) & mask) + bypassed_lsb[pmi];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lanes leave the rows and the filter states that one channel at a time
+    /// leaves, and refuse the blocks in which a state leaves its range.
+    #[test]
+    fn lanes_match_one_channel_at_a_time() {
+        if !lanes_available() {
+            return;
+        }
+
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut random = |bits: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed as i64 >> (64 - bits)) as i32
+        };
+        let mut states = Box::new([[[0; LANES]; 2]; STATE_BASE + 8]);
+        let (mut in_range, mut out_of_range) = (0, 0);
+
+        for round in 0..400usize {
+            let wide = round % 5 == 0;
+            let channels = 1 + round % LANES;
+            let chi = [0, 3, 12, 16 - channels][round / LANES % 4];
+            let block_size = 8 + (random(16) as usize & 0xFFFF) % 153;
+            // Mostly residuals a stable filter keeps in range, sometimes not.
+            let residual_bits = if round % 7 == 0 { 24 } else { 16 };
+
+            let filters: Vec<Recorrelator> = (0..channels)
+                .map(|_| Recorrelator {
+                    fir: core::array::from_fn(|_| random(11)),
+                    iir: core::array::from_fn(|_| random(10)),
+                    shift: 8 + (random(4) & 7),
+                    mask: !((1 << (random(3) & 3)) - 1),
+                })
+                .collect();
+            let block_data: Vec<[i32; 16]> = (0..block_size)
+                .map(|_| core::array::from_fn(|_| random(residual_bits)))
+                .collect();
+            let coeff_state: [[[i32; 8]; 16]; 2] = core::array::from_fn(|_| {
+                core::array::from_fn(|_| core::array::from_fn(|_| random(20)))
+            });
+
+            let mut one_state = coeff_state;
+            let mut one_rows = vec![[0x5a5a5a5a; 16]; block_size];
+            let one_at_a_time = filters.iter().zip(chi..).all(|(filter, chi)| {
+                let [fir, iir] = &mut one_state.each_mut().map(|state| &mut state[chi]);
+
+                recorrelate(filter, [fir, iir], &block_data, &mut one_rows, chi, wide).is_ok()
+            });
+
+            let mut lane_state = coeff_state;
+            let mut lane_rows = vec![[0x5a5a5a5a; 16]; block_size];
+            let side_by_side = recorrelate_lanes(
+                &filters,
+                &mut lane_state,
+                &mut states,
+                &block_data,
+                &mut lane_rows,
+                chi,
+                wide,
+            );
+
+            assert_eq!(side_by_side, one_at_a_time, "round {round}");
+            if side_by_side {
+                assert_eq!(lane_rows, one_rows, "round {round}");
+                assert_eq!(lane_state, one_state, "round {round}");
+                in_range += 1;
+            } else {
+                out_of_range += 1;
+            }
+        }
+
+        assert!(
+            in_range > 100 && out_of_range > 10,
+            "{in_range} {out_of_range}"
+        );
     }
 }
