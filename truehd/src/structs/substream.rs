@@ -148,13 +148,41 @@ pub struct SubstreamSegment {
 
 impl SubstreamSegment {
     pub fn read(state: &mut ParserState, reader: &mut BsIoSliceReader) -> Result<Self> {
+        let mut ss = Self::default();
+
+        ss.read_into(state, reader)?;
+        Ok(ss)
+    }
+
+    /// As [`Default`] gives it, but for the allocation of its blocks.
+    pub(crate) fn clear(&mut self) {
+        self.block.clear();
+        self.substream_parity = 0;
+        self.substream_crc = 0;
+        self.terminator = None;
+    }
+
+    /// [`SubstreamSegment::read`] over a segment that is already there, whose
+    /// blocks keep the allocations of their sample rows.
+    pub(crate) fn read_into(
+        &mut self,
+        state: &mut ParserState,
+        reader: &mut BsIoSliceReader,
+    ) -> Result<()> {
         // No start-alignment check: everything between the access unit start and the
         // first segment is a whole number of 16-bit words (the 32-bit header, a major
         // sync info that ends 16-bit aligned, 16- or 32-bit directory entries), and a
         // segment that ends misaligned ends the access unit before the next one starts.
         let start_pos = reader.position()?;
 
-        let mut ss = Self::default();
+        let ss = self;
+
+        ss.substream_parity = 0;
+        ss.substream_crc = 0;
+        ss.terminator = None;
+
+        // The blocks read so far: those past them are of the segment before.
+        let mut block_count = 0;
         let mut last_block_in_segment = false;
         let mut decoded = 0;
         state.substream_state_mut()?.restart.block_index = 0;
@@ -162,24 +190,29 @@ impl SubstreamSegment {
         let blocks = Timer::start();
 
         while !last_block_in_segment {
-            if ss.block.len() > 4 || ss.block.len() >= 3 && state.format_sync == MAJOR_SYNC_FBA {
+            if block_count > 4 || block_count >= 3 && state.format_sync == MAJOR_SYNC_FBA {
                 log_or_err!(
                     state,
                     log::Level::Warn,
-                    anyhow!(SubstreamError::TooManyBlocks(ss.block.len())),
+                    anyhow!(SubstreamError::TooManyBlocks(block_count)),
                     reader
                 );
             }
             // Built in place; a block that fails to read fails the whole segment.
             // Not `push`, which builds the block before it knows where it goes and
             // then copies it there.
-            ss.block.resize_with(ss.block.len() + 1, Block::default);
-            let block = ss.block.last_mut().expect("a block was just added");
-            block.read_into(state, reader)?;
+            if block_count == ss.block.len() {
+                ss.block.resize_with(block_count + 1, Block::default);
+            } else {
+                ss.block[block_count].reset();
+            }
+            ss.block[block_count].read_into(state, reader)?;
+            block_count += 1;
             decoded += state.substream_state()?.restart.block_size;
             last_block_in_segment = reader.get()?;
             state.substream_state_mut()?.restart.block_index += 1;
         }
+        ss.block.truncate(block_count);
         blocks.record(&mut state.perf.substream_segment_blocks);
 
         let tail = Timer::start();
@@ -361,6 +394,6 @@ impl SubstreamSegment {
 
         tail.record(&mut state.perf.substream_segment_tail);
 
-        Ok(ss)
+        Ok(())
     }
 }

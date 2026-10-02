@@ -72,6 +72,20 @@ pub struct AccessUnit {
 
 impl AccessUnit {
     pub fn read(state: &mut ParserState, reader: &mut BsIoSliceReader) -> Result<Self> {
+        let mut au = Self::default();
+
+        au.read_into(state, reader)?;
+        Ok(au)
+    }
+
+    /// [`AccessUnit::read`] over an access unit that is already there, whose
+    /// segments keep their blocks' allocations. Where it fails, `self` is part
+    /// what was read and part what it held.
+    pub(crate) fn read_into(
+        &mut self,
+        state: &mut ParserState,
+        reader: &mut BsIoSliceReader,
+    ) -> Result<()> {
         let access_unit = Timer::start();
         state.is_major_sync = false;
 
@@ -89,12 +103,17 @@ impl AccessUnit {
         state.peak_data_rate_jump = false;
         state.has_substream_info_changed = false;
 
-        let mut au = Self {
-            check_nibble: reader.get_n(4)?,
-            access_unit_length: reader.get_n(12)?,
-            input_timing: reader.get_n(16)?,
-            ..Default::default()
-        };
+        let au = self;
+
+        au.major_sync_info = None;
+        au.substream_directory = Default::default();
+        au.extra_data = None;
+        au.has_valid_branch = false;
+        au.has_invalid_branch = false;
+
+        au.check_nibble = reader.get_n(4)?;
+        au.access_unit_length = reader.get_n(12)?;
+        au.input_timing = reader.get_n(16)?;
 
         state.input_timing = au.input_timing as usize;
 
@@ -228,10 +247,14 @@ impl AccessUnit {
                 reader.skip_n(offset as u32)?;
 
                 trace!("Skipping substream {i} segment of length {offset}");
+                au.substream_segment[i].clear();
                 continue;
             }
-            au.substream_segment[i] = SubstreamSegment::read(state, reader)?;
+            au.substream_segment[i].read_into(state, reader)?;
             state.has_parsed_substream = true;
+        }
+        for segment in au.substream_segment.iter_mut().skip(substreams) {
+            segment.clear();
         }
         segments.record(&mut state.perf.substream_segments);
 
@@ -272,13 +295,13 @@ impl AccessUnit {
             );
         }
 
-        Self::check_fifo_depth(state, &au)?;
+        Self::check_fifo_depth(state, au)?;
 
         state.au_counter += 1; // TODO: migrate to gap check, should reset on sync check
 
         au.has_valid_branch = state.has_valid_branch || state.has_substream_info_changed;
 
-        Ok(au)
+        Ok(())
     }
 
     /// Every substream must carry the same `hires_output_timing` bit.

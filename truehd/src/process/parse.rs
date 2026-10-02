@@ -37,28 +37,53 @@ impl Parser {
     /// and timing information. Handles both major sync frames (with stream
     /// configuration) and continuation frames (audio data only).
     pub fn parse(&mut self, frame: &Frame) -> Result<AccessUnit> {
-        self.parse_inner(frame).0
+        let mut access_unit = AccessUnit::default();
+
+        self.parse_into(frame, &mut access_unit)?;
+        Ok(access_unit)
     }
 
-    fn parse_inner(&mut self, frame: &Frame) -> (Result<AccessUnit>, Option<u64>) {
+    /// Parses a frame into an access unit that is already there.
+    ///
+    /// As [`parse`](Self::parse), which builds a new [`AccessUnit`] for every
+    /// frame and allocates the blocks of each of its substreams and the sample
+    /// rows of each block. Here the access unit `access_unit` holds is written
+    /// over and its allocations are reused, so one [`AccessUnit`], which
+    /// [`Default`] gives, serves a whole stream.
+    ///
+    /// Where parsing fails, `access_unit` is left as [`Default`] gives it.
+    pub fn parse_into(&mut self, frame: &Frame, access_unit: &mut AccessUnit) -> Result<()> {
+        self.parse_inner(frame, access_unit).0
+    }
+
+    fn parse_inner(
+        &mut self,
+        frame: &Frame,
+        access_unit: &mut AccessUnit,
+    ) -> (Result<()>, Option<u64>) {
         self.state.perf = ParserPerfStats::default();
         self.state.au_index = frame.index;
         self.state.au_offset = frame.offset;
 
         // Refused before reading, since reading the header moves the timing state.
         if !self.state.has_parsed_au && !frame.is_major_sync() {
+            *access_unit = AccessUnit::default();
             return (Err(anyhow!(AccessUnitError::MissingInitialSync)), Some(32));
         }
 
         let reader = &mut BsIoSliceReader::from_slice(frame.as_ref());
-        let access_unit = AccessUnit::read(&mut self.state, reader);
+        let read = access_unit.read_into(&mut self.state, reader);
 
-        let bit_offset = match access_unit {
-            Ok(_) => None,
-            Err(_) => bit_position(reader),
+        let bit_offset = match read {
+            Ok(()) => None,
+            Err(_) => {
+                // What it holds is part this frame and part the one before.
+                *access_unit = AccessUnit::default();
+                bit_position(reader)
+            }
         };
 
-        (access_unit, bit_offset)
+        (read, bit_offset)
     }
 
     /// Parses a frame, recording what fails instead of returning it.
@@ -82,8 +107,10 @@ impl Parser {
 
         let recorded = self.state.diagnostics.len();
 
-        match self.parse_inner(frame) {
-            (Ok(access_unit), _) => {
+        let mut access_unit = AccessUnit::default();
+
+        match self.parse_inner(frame, &mut access_unit) {
+            (Ok(()), _) => {
                 self.resyncing = false;
 
                 Some(access_unit)

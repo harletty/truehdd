@@ -231,8 +231,17 @@ impl Block {
         Ok(b)
     }
 
+    /// As [`Default`] gives it, but for its sample rows, which
+    /// [`read_into`](Self::read_into) sizes and clears when it comes to them.
+    pub(crate) fn reset(&mut self) {
+        self.restart_header = None;
+        self.block_header = None;
+        self.block_data_bits = None;
+        self.block_header_crc = 0;
+    }
+
     /// [`Block::read`] into a block that is already where it will live. `self` must be
-    /// freshly defaulted.
+    /// freshly defaulted or [`reset`](Self::reset).
     pub(crate) fn read_into(
         &mut self,
         state: &mut ParserState,
@@ -439,8 +448,11 @@ impl Block {
             }
         }
 
-        b.bypassed_lsb = vec![[0; 16]; block_size];
-        b.block_data = vec![[0; 16]; block_size];
+        // Over the rows of the block read here before, where there was one.
+        b.bypassed_lsb.clear();
+        b.bypassed_lsb.resize(block_size, [0; 16]);
+        b.block_data.clear();
+        b.block_data.resize(block_size, [0; 16]);
 
         header_setup.record(&mut state.perf.block_header_setup);
 
