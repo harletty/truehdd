@@ -1,6 +1,7 @@
 use crate::log_or_err;
 use crate::process::{MAX_PRESENTATIONS, PresentationMap, PresentationType};
 use crate::structs::access_unit::AccessUnit;
+use crate::structs::block::Block;
 use crate::structs::channel::ChannelLabel;
 use crate::structs::oamd::ObjectAudioMetadataPayload;
 use crate::utils::dither::dither_31eb;
@@ -33,10 +34,19 @@ impl Decoder {
         let mut required_presentations = [false; MAX_PRESENTATIONS];
         required_presentations[presentation] = true;
 
-        self.decode_presentations(access_unit, &required_presentations)?
-            .iter()
-            .find_map(|decoded| decoded.clone())
-            .ok_or_else(|| anyhow!("Failed to get presentation {presentation}"))
+        // Not through `decode_presentations`: only the one result is built, rather
+        // than an array of four boxed and the result cloned out of it.
+        self.state
+            .decode_access_unit(access_unit, &required_presentations)?;
+
+        // Read the flag and reset it, ahead of the result that reports it: built
+        // last, the result is built where it is returned.
+        let substream_info_changed = std::mem::take(&mut self.state.substream_info_changed);
+
+        match self.state.effective_presentations.iter().position(|&p| p) {
+            Some(i) => self.state.create_decoded_result(i, substream_info_changed),
+            None => Err(anyhow!("Failed to get presentation {presentation}")),
+        }
     }
 
     /// Decodes multiple presentations from an access unit.
@@ -180,8 +190,6 @@ pub struct DecoderSubstreamState {
     pub coeff: [[[i32; 8]; 16]; 2],
     pub coeff_state: [[[i32; 8]; 16]; 2],
 
-    pub bypassed_lsb: Box<[[i32; 16]; 160]>,
-    pub block_data: Box<[[i32; 16]; 160]>,
     pub dither_table: [i32; 256],
     pub decoded_sample_len: usize,
 
@@ -227,8 +235,6 @@ impl Default for DecoderSubstreamState {
             coeff: [[[0; 8]; 16]; 2],
             coeff_state: [[[0; 8]; 16]; 2],
 
-            bypassed_lsb: Box::new([[0; 16]; 160]),
-            block_data: Box::new([[0; 16]; 160]),
             dither_table: [0; 256],
             decoded_sample_len: 0,
 
@@ -329,6 +335,27 @@ impl DecoderState {
         access_unit: &AccessUnit,
         required_presentations: &[bool; MAX_PRESENTATIONS],
     ) -> Result<[Option<DecodedAccessUnit>; MAX_PRESENTATIONS]> {
+        self.decode_access_unit(access_unit, required_presentations)?;
+
+        let mut result: [Option<DecodedAccessUnit>; MAX_PRESENTATIONS] =
+            core::array::from_fn(|_| None);
+
+        for (i, decoded) in result.iter_mut().enumerate() {
+            if self.effective_presentations[i] {
+                *decoded = Some(self.create_decoded_result(i, self.substream_info_changed)?);
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Decode an access unit into the substreams' output buffers, without building
+    /// any result from them.
+    fn decode_access_unit(
+        &mut self,
+        access_unit: &AccessUnit,
+        required_presentations: &[bool; MAX_PRESENTATIONS],
+    ) -> Result<()> {
         access_unit.update_decoder_state(self)?;
 
         if !self.valid {
@@ -380,23 +407,14 @@ impl DecoderState {
 
             for block in substream_segment.block.iter() {
                 block.update_decoder_state(self)?;
-                self.decode_multi()?;
-            }
-        }
-
-        let mut result: [Option<DecodedAccessUnit>; MAX_PRESENTATIONS] =
-            core::array::from_fn(|_| None);
-
-        for (i, decoded) in result.iter_mut().enumerate() {
-            if self.effective_presentations[i] {
-                *decoded = Some(self.create_decoded_result(i)?);
+                self.decode_multi(block)?;
             }
         }
 
         self.valid = true;
         self.counter += 1;
 
-        Ok(result)
+        Ok(())
     }
 
     fn update_presentations(
@@ -460,7 +478,7 @@ impl DecoderState {
         }
     }
 
-    fn decode_multi(&mut self) -> Result<()> {
+    fn decode_multi(&mut self, block: &Block) -> Result<()> {
         let DecoderSubstreamState {
             restart_sync_word,
             min_chan,
@@ -501,12 +519,14 @@ impl DecoderState {
             let decoded_sample_len = ss_state.decoded_sample_len;
             let coeff_state = &mut ss_state.coeff_state;
             let rematrix_buffer = &mut ss_state.rematrix_buffer[decoded_sample_len..];
-            let block_data = &ss_state.block_data;
+            let block_data = &block.block_data;
+
+            // Shared by the channels: each one reads only what it wrote itself or
+            // loaded from its coefficient state, so it needs no clearing in between.
+            let mut state_buffer = [[0; 168]; 2];
 
             #[allow(clippy::needless_range_loop)]
             for chi in min_chan..=max_chan {
-                let mut state_buffer = [[0; 168]; 2];
-
                 state_buffer[0][160..].copy_from_slice(&coeff_state[0][chi]);
                 state_buffer[1][160..].copy_from_slice(&coeff_state[1][chi]);
 
@@ -589,7 +609,7 @@ impl DecoderState {
             let ss_state = &mut self.substream_state[current_substream_index];
             let decoded_sample_len = &mut ss_state.decoded_sample_len;
             let dither_seed = &mut ss_state.dither_seed;
-            let bypassed_lsb = &mut ss_state.bypassed_lsb;
+            let bypassed_lsb = &block.bypassed_lsb;
             let m_coeff = &mut ss_state.m_coeff;
             let dither_table = &mut ss_state.dither_table;
             let rematrix_buffer = &mut self.rematrix_buffer[*decoded_sample_len..];
@@ -598,7 +618,7 @@ impl DecoderState {
                 0x31EA => {
                     for blki in 0..block_size {
                         let rematrix_buffer = &mut rematrix_buffer[blki];
-                        let bypassed_lsb = &mut bypassed_lsb[blki];
+                        let bypassed_lsb = &bypassed_lsb[blki];
                         let dither_seed_shr7 = *dither_seed >> 7;
 
                         rematrix_buffer[max_matrix_chan + 1] =
@@ -635,7 +655,7 @@ impl DecoderState {
 
                     for blki in 0..block_size {
                         let rematrix_buffer = &mut rematrix_buffer[blki];
-                        let bypassed_lsb = &mut bypassed_lsb[blki];
+                        let bypassed_lsb = &bypassed_lsb[blki];
                         let blki_abs = blki + *decoded_sample_len;
 
                         for pmi in 0..primitive_matrices {
@@ -674,7 +694,7 @@ impl DecoderState {
 
                     for blki in 0..block_size {
                         let rematrix_buffer = &mut rematrix_buffer[blki];
-                        let bypassed_lsb = &mut bypassed_lsb[blki];
+                        let bypassed_lsb = &bypassed_lsb[blki];
                         let blki_abs = blki + *decoded_sample_len;
 
                         for pmi in 0..primitive_matrices {
@@ -810,7 +830,11 @@ impl DecoderState {
         Ok(())
     }
 
-    fn create_decoded_result(&self, presentation_idx: usize) -> Result<DecodedAccessUnit> {
+    fn create_decoded_result(
+        &self,
+        presentation_idx: usize,
+        substream_info_changed: bool,
+    ) -> Result<DecodedAccessUnit> {
         let decoded = DecodedAccessUnit {
             channel_labels: self.substream_state[presentation_idx]
                 .channel_labels
@@ -826,7 +850,7 @@ impl DecoderState {
                 vec![]
             },
             is_duplicate: self.has_duplicate_timing && self.has_duplicate_sample,
-            substream_info_changed: self.substream_info_changed,
+            substream_info_changed,
         };
 
         Ok(decoded)

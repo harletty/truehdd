@@ -188,8 +188,21 @@ impl BlockHeader {
 
 impl Block {
     pub fn read(state: &mut ParserState, reader: &mut BsIoSliceReader) -> Result<Self> {
-        let header_setup = Timer::start();
         let mut b = Block::default();
+        b.read_into(state, reader)?;
+        Ok(b)
+    }
+
+    /// [`Block::read`] into a block that is already where it will live: a block is
+    /// 20 KiB of sample arrays, which `read` would move through its `Result` and into
+    /// the segment's `Vec` once more. `self` must be freshly defaulted.
+    pub(crate) fn read_into(
+        &mut self,
+        state: &mut ParserState,
+        reader: &mut BsIoSliceReader,
+    ) -> Result<()> {
+        let header_setup = Timer::start();
+        let b = self;
 
         // block_header_exists
         if reader.get()? {
@@ -420,7 +433,6 @@ impl Block {
             bypassed_lsb.record(&mut state.perf.block_bypassed_lsb);
             let block_data = &mut b.block_data[blki];
 
-            let mut channel_data = [0i32; 16];
             let mut position_checks_needed = false;
 
             let huffman = Timer::start();
@@ -505,11 +517,8 @@ impl Block {
                     }
                 }
 
-                channel_data[chi] = audio_data;
+                block_data[chi] = audio_data;
             }
-
-            block_data[min_chan..(max_chan + 1)]
-                .copy_from_slice(&channel_data[min_chan..(max_chan + 1)]);
 
             huffman.record(&mut state.perf.block_huffman_decode);
         }
@@ -535,7 +544,7 @@ impl Block {
 
         checks.record(&mut state.perf.block_checks);
 
-        Ok(b)
+        Ok(())
     }
 
     pub fn update_decoder_state(&self, state: &mut DecoderState) -> Result<()> {
@@ -552,10 +561,7 @@ impl Block {
             block_header.update_decoder_state(state)?;
         }
 
-        let ss_state = state.substream_state_mut()?;
-        *ss_state.bypassed_lsb = self.bypassed_lsb;
-        *ss_state.block_data = self.block_data;
-
+        // The samples stay in the block: the decoder reads them from it.
         Ok(())
     }
 }
