@@ -11,9 +11,8 @@
 //! an error variant fails to compile until the rule is named.
 
 use std::fmt;
-use std::io::{Read, Seek};
 
-use crate::utils::bitstream_io::BitstreamIoReader;
+use crate::utils::bitstream_io::BsIoSliceReader;
 use crate::utils::errors::*;
 
 /// The stable identity of the check a value reports.
@@ -418,7 +417,7 @@ where
 }
 
 /// Bit position of a reader, for the checks that hold one.
-pub fn bit_position<R: Read + Seek>(reader: &mut BitstreamIoReader<R>) -> Option<u64> {
+pub fn bit_position(reader: &mut BsIoSliceReader) -> Option<u64> {
     reader.position().ok()
 }
 
