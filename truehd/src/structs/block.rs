@@ -20,7 +20,9 @@ use crate::process::parse::{ParserRestartState, ParserState};
 use crate::structs::channel::ChannelParams;
 use crate::structs::matrix::Matrixing;
 use crate::structs::restart_header::{Guards, GuardsField, RestartHeader};
-use crate::utils::bitstream_io::{BsIoSliceReader, HUFFMAN_DEEPEST_CODE};
+use crate::utils::bitstream_io::{
+    BsIoSliceReader, HUFFMAN_DEEPEST_CODE, HuffmanTable, huffman_table_of,
+};
 use crate::utils::errors::BlockError;
 use crate::utils::perf::Timer;
 
@@ -61,6 +63,50 @@ impl Default for Block {
             bypassed_lsb: [[0; 16]; 160],
             block_data: [[0; 16]; 160],
             block_header_crc: 0,
+        }
+    }
+}
+
+/// How a channel's samples are read through a block: the constants of the
+/// arithmetic, and whether the parameters allow reading a sample in one go.
+#[derive(Clone, Copy, Default)]
+struct SampleRead {
+    /// Whether the fields below hold. Parameters out of their ranges are left to
+    /// the reads that report them.
+    plain: bool,
+    table: Option<&'static HuffmanTable>,
+    lsbs_bits: u32,
+    /// The channel's offset, less what centres the code and the bits after it.
+    bias: i32,
+    quantiser_step_size: u32,
+}
+
+impl SampleRead {
+    fn new(huff_type: usize, huff_lsbs: u32, huff_offset: i32, quantiser_step_size: u32) -> Self {
+        // No more bits after the code than a window gives up at once along with
+        // the longest code, which also keeps the arithmetic from overflowing.
+        if quantiser_step_size > huff_lsbs || huff_lsbs - quantiser_step_size > 22 || huff_type > 3
+        {
+            return Self::default();
+        }
+
+        let lsbs_bits = huff_lsbs - quantiser_step_size;
+        let centre = if huff_type != 0 {
+            let shift = lsbs_bits as i32 + (2 - huff_type as i32);
+
+            if shift < 0 { 0 } else { 1 << shift }
+        } else if lsbs_bits > 0 {
+            1 << (lsbs_bits - 1)
+        } else {
+            0
+        };
+
+        Self {
+            plain: true,
+            table: huffman_table_of(huff_type),
+            lsbs_bits,
+            bias: huff_offset.wrapping_sub(centre),
+            quantiser_step_size,
         }
     }
 }
@@ -407,42 +453,117 @@ impl Block {
 
         header_setup.record(&mut state.perf.block_header_setup);
 
+        // What a sample of each channel takes to read, settled once for the block.
+        let mut sample_reads = [SampleRead::default(); 16];
+        for chi in min_chan..max_chan + 1 {
+            sample_reads[chi & 15] = SampleRead::new(
+                huff_type[chi],
+                huff_lsbs[chi],
+                huff_offset[chi],
+                quantiser_step_size[chi],
+            );
+        }
+
+        // The matrices that bypass a bit, where each bypasses one at most.
+        let mut bypassing = [0usize; 16];
+        let mut bypassing_len = 0;
+        if restart_sync_word != 0x31EC {
+            for (pmi, _) in lsb_bypass_used
+                .iter()
+                .enumerate()
+                .take(primitive_matrices)
+                .filter(|(_, used)| **used)
+            {
+                bypassing[bypassing_len] = pmi;
+                bypassing_len += 1;
+            }
+        }
+        let bypassing = &bypassing[..bypassing_len];
+        let checked = restart_sync_word != 0x31EC;
+
+        let mut window = reader.window();
+
         for blki in 0..block_size {
             // bypassed_lsb
             let bypassed_lsb = Timer::start();
-            let bypassed_lsb_start_pos = reader.position()?;
+            let bypassed_lsb_row = &mut b.bypassed_lsb[blki];
+            let mut bypassed_lsb_bits = 0;
 
             if restart_sync_word == 0x31EC {
                 for pmi in 0..primitive_matrices {
-                    let lsb_bypass_bit_count = lsb_bypass_bit_count[pmi];
+                    let lsb_bypass_bit_count = lsb_bypass_bit_count[pmi] as u32;
 
-                    b.bypassed_lsb[blki][pmi] = if lsb_bypass_bit_count != 0 {
-                        reader.get_n::<u8>(lsb_bypass_bit_count as u32)?
-                    } else {
+                    bypassed_lsb_row[pmi] = if lsb_bypass_bit_count == 0 {
                         0
-                    } as i32;
+                    } else if lsb_bypass_bit_count <= 8
+                        && let Some(bits) = window.take(lsb_bypass_bit_count)
+                    {
+                        bits as i32
+                    } else {
+                        reader.resume(&window);
+                        let bits = reader.get_n::<u8>(lsb_bypass_bit_count)?;
+                        window = reader.window();
+                        bits as i32
+                    };
+                    bypassed_lsb_bits += lsb_bypass_bit_count as u64;
                 }
             } else {
-                for pmi in 0..primitive_matrices {
-                    let lsb_bypass_used = lsb_bypass_used[pmi];
-
-                    b.bypassed_lsb[blki][pmi] = if lsb_bypass_used {
-                        reader.get_n::<u8>(1)?
-                    } else {
-                        0
-                    } as i32;
+                // All of them out of one look at the stream.
+                if let Some(bits) = window.take(bypassing.len() as u32) {
+                    for (read, &pmi) in bypassing.iter().enumerate() {
+                        bypassed_lsb_row[pmi] = ((bits >> (bypassing.len() - 1 - read)) & 1) as i32;
+                    }
+                } else {
+                    reader.resume(&window);
+                    for &pmi in bypassing {
+                        bypassed_lsb_row[pmi] = reader.get_n::<u8>(1)? as i32;
+                    }
+                    window = reader.window();
                 }
+                bypassed_lsb_bits += bypassing.len() as u64;
             }
 
-            let bypassed_lsb_bits = reader.position()? - bypassed_lsb_start_pos;
             bypassed_lsb.record(&mut state.perf.block_bypassed_lsb);
             let block_data = &mut b.block_data[blki];
 
-            let mut position_checks_needed = false;
-
             let huffman = Timer::start();
             // huff decode
-            for chi in min_chan..=max_chan {
+            for chi in min_chan..max_chan + 1 {
+                let read = &sample_reads[chi & 15];
+
+                // The code and the bits after it, out of one look at the stream.
+                // A sample that anything is to be said about is left to the reads
+                // below, which say it.
+                if read.plain
+                    && let Some(loaded) = window.load()
+                {
+                    let word = window.bits();
+                    let (code, code_len) = match read.table {
+                        Some(table) => {
+                            let (code, len) = table[(word >> 55) as usize];
+                            (code as i32, len as u32)
+                        }
+                        None => (0, 0),
+                    };
+                    let size = code_len + read.lsbs_bits;
+                    let lsbs = ((word << code_len) >> 32 >> (32 - read.lsbs_bits)) as i32;
+                    let audio_data =
+                        (lsbs + (code << read.lsbs_bits) + read.bias) << read.quantiser_step_size;
+
+                    if code != HUFFMAN_DEEPEST_CODE
+                        && (!checked
+                            || ((-(1 << 23)..1 << 23).contains(&audio_data)
+                                && size <= 29
+                                && (chi != min_chan || size as u64 + bypassed_lsb_bits <= 32)))
+                    {
+                        window.consume(loaded, size);
+                        block_data[chi] = audio_data;
+                        continue;
+                    }
+                }
+
+                reader.resume(&window);
+
                 let huff_offset = huff_offset[chi];
                 let huff_type = huff_type[chi];
                 let huff_lsbs = huff_lsbs[chi];
@@ -452,12 +573,7 @@ impl Block {
                 }
 
                 let lsbs_bits = huff_lsbs - quantiser_step_size;
-                let huff_start_pos = if restart_sync_word != 0x31EC {
-                    position_checks_needed = true;
-                    reader.position()?
-                } else {
-                    0
-                };
+                let huff_start_pos = reader.position()?;
 
                 let mut audio_data = if huff_type != 0 {
                     let huff_code = reader.get_huffman(huff_type)?;
@@ -501,7 +617,7 @@ impl Block {
                 audio_data += huff_offset;
                 audio_data <<= quantiser_step_size;
 
-                if position_checks_needed {
+                if checked {
                     let huff_size = reader.position()? - huff_start_pos;
 
                     if audio_data >= 1 << 23 {
@@ -523,10 +639,13 @@ impl Block {
                 }
 
                 block_data[chi] = audio_data;
+                window = reader.window();
             }
 
             huffman.record(&mut state.perf.block_huffman_decode);
         }
+
+        reader.resume(&window);
 
         if let Some(block_data_bits) = b.block_data_bits {
             let actual_block_data_bits = reader.position()? - block_data_start_pos;

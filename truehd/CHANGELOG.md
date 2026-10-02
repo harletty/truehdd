@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Crc8::update` advances eight bytes per step instead of one, with the same result. The substream check runs over every byte of the stream, and decoding takes 1 to 5% less time
 - Decoding applies each lossless matrix to a whole block at a time, with only the coefficients that are not zero, and takes about a quarter less time
 - Parsing builds a block and its header where they live instead of copying them there, and decoding takes 2 to 5% less time
+- Parsing reads a block's samples through a word it carries from one sample to the next, and decoding takes 11 to 17% less time
 - **BREAKING**: `structs::oamd` re-exports the [`oamd`](https://crates.io/crates/oamd) crate, which now owns these structures. Every type and function keeps the path it had, but `TEST_DATA` is `EXAMPLE_DATA` there and the other test payloads are no longer public
 
 ### Fixed

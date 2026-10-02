@@ -396,7 +396,7 @@ impl_bits!(SignedBits, i64: i8, i16, i32, i64);
 
 /// A Huffman table indexed by the next nine bits of the stream: the symbol those
 /// bits start with, and the length of its code.
-type HuffmanTable = [(i8, u8); 512];
+pub(crate) type HuffmanTable = [(i8, u8); 512];
 
 /// The three tables share one shape. A `1` starts the codes of the smallest
 /// symbols, followed by `small_bits` bits that are the symbol. A `0` starts the
@@ -436,6 +436,91 @@ const fn huffman_table(positive_base: i8, small_bits: u32) -> HuffmanTable {
 static HUFFMAN_TABLE_1: HuffmanTable = huffman_table(4, 2);
 static HUFFMAN_TABLE_2: HuffmanTable = huffman_table(2, 1);
 static HUFFMAN_TABLE_3: HuffmanTable = huffman_table(1, 0);
+
+/// The table of a Huffman type, which type 0 and the types there are not lack.
+pub(crate) fn huffman_table_of(huff_type: usize) -> Option<&'static HuffmanTable> {
+    match huff_type {
+        1 => Some(&HUFFMAN_TABLE_1),
+        2 => Some(&HUFFMAN_TABLE_2),
+        3 => Some(&HUFFMAN_TABLE_3),
+        _ => None,
+    }
+}
+
+/// The next bits of a stream held in a word, for a run of short reads.
+///
+/// A [`SliceBitReader`] loads its word from the slice at every read, so each read
+/// waits on that load before it can tell the next one where to look. Here the
+/// word is carried from one read to the next, and the load that refills it is one
+/// that the read after it waits for, not this one: a run of Huffman codes, each
+/// placing the next, goes about twice as fast.
+///
+/// A read is two steps. [`load`](Self::load) fetches the refill, and fails near
+/// the end of the data, where the caller goes back to the reader. The caller
+/// then takes what it wants from the top of [`bits`](Self::bits), of which at
+/// least 33 are stream bits, and [`consume`](Self::consume)s at most 31 of them.
+#[derive(Clone)]
+pub(crate) struct BitWindow<'a> {
+    data: &'a [u8],
+    /// The stream from the position on, most significant bit first. The top
+    /// `count` bits are stream bits, and so is every bit below them that is set.
+    bits: u64,
+    count: u32,
+    /// The byte the stream bits of `bits` end before.
+    byte: usize,
+}
+
+impl BitWindow<'_> {
+    /// The stream from the position on, in the high bits of the word.
+    #[inline(always)]
+    pub(crate) fn bits(&self) -> u64 {
+        self.bits
+    }
+
+    /// The eight bytes that refill the window, if the data has them.
+    #[inline(always)]
+    pub(crate) fn load(&self) -> Option<u64> {
+        let bytes = self.data.get(self.byte..self.byte + 8)?;
+
+        Some(u64::from_be_bytes(bytes.try_into().unwrap()))
+    }
+
+    /// Move past `n` bits, at most 31, and refill with what [`load`](Self::load)
+    /// returned.
+    #[inline(always)]
+    pub(crate) fn consume(&mut self, loaded: u64, n: u32) {
+        debug_assert!(n <= 31);
+
+        // The refill lands below the bits there are, and the bytes it is counted
+        // for are the whole ones: the bits of the next byte it also brings are
+        // stream bits, which the next refill brings again.
+        let refilled = self.bits | (loaded >> self.count);
+
+        self.byte += ((63 - self.count) >> 3) as usize;
+        self.bits = refilled << n;
+        self.count = (self.count | 56) - n;
+    }
+
+    /// The next `n` bits, at most 31, or `None` near the end of the data.
+    #[inline(always)]
+    pub(crate) fn take(&mut self, n: u32) -> Option<u64> {
+        if n == 0 {
+            return Some(0);
+        }
+
+        let loaded = self.load()?;
+        let value = self.bits >> (64 - n);
+
+        self.consume(loaded, n);
+        Some(value)
+    }
+
+    /// The position in the stream, in bits, unless the window never opened.
+    #[inline(always)]
+    fn position(&self) -> Option<u64> {
+        (self.count != 0).then(|| ((self.byte as u64) << 3) - self.count as u64)
+    }
+}
 
 /// A bit reader over a byte slice, most significant bit first.
 ///
@@ -477,6 +562,35 @@ impl<'a> SliceBitReader<'a> {
             }
         };
         word << (pos & 7)
+    }
+
+    /// A [`BitWindow`] on the stream at the position, for a run of short reads.
+    /// The reader stays where it is until [`resume`](Self::resume).
+    #[inline(always)]
+    pub(crate) fn window(&self) -> BitWindow<'a> {
+        let mut window = BitWindow {
+            data: &self.data[..(self.len >> 3) as usize],
+            bits: 0,
+            count: 0,
+            byte: (self.pos >> 3) as usize,
+        };
+
+        // What the first load takes in, less the bits of its first byte that
+        // are already read. Past the end there is nothing to load, and the
+        // window stays empty, which every read from it reports.
+        if let Some(loaded) = window.load() {
+            window.consume(loaded, (self.pos & 7) as u32);
+        }
+
+        window
+    }
+
+    /// Move to where `window` has read to.
+    #[inline(always)]
+    pub(crate) fn resume(&mut self, window: &BitWindow<'a>) {
+        if let Some(pos) = window.position() {
+            self.pos = pos;
+        }
     }
 
     #[cold]
@@ -747,6 +861,57 @@ impl<'a> SliceBitReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A window reads the bits the reader reads, whatever the widths and wherever
+    /// it opens, and hands the reader back the position it reached.
+    #[test]
+    fn window_reads_match_the_reader() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let data: Vec<u8> = (0..257).map(|_| random() as u8).collect();
+
+        for start in [0, 1, 7, 8, 13, 250] {
+            let mut reader = SliceBitReader::from_slice(&data);
+            reader.skip_n(start).unwrap();
+            let mut expected = reader.clone();
+            let mut window = reader.window();
+
+            while let Some(loaded) = window.load() {
+                let n = (random() % 32) as u32;
+                // By the two steps of a read, and by the two at once.
+                let value = if random() & 1 == 0 {
+                    let value = if n == 0 { 0 } else { window.bits() >> (64 - n) };
+
+                    window.consume(loaded, n);
+                    value
+                } else {
+                    window.take(n).unwrap()
+                };
+
+                assert_eq!(value, expected.get_n::<u32>(n).unwrap() as u64, "{n} bits");
+
+                let mut resumed = reader.clone();
+                resumed.resume(&window);
+                assert_eq!(resumed.position().unwrap(), expected.position().unwrap());
+            }
+
+            // It gives up only where a refill would run past the data.
+            assert!(expected.position().unwrap() + 127 >= (data.len() as u64) << 3);
+        }
+
+        // On fewer than eight bytes it never opens, and moves the reader nowhere.
+        let mut reader = SliceBitReader::from_slice(&data[..5]);
+        reader.skip_n(3).unwrap();
+        let window = reader.window();
+        assert!(window.load().is_none());
+        reader.resume(&window);
+        assert_eq!(reader.position().unwrap(), 3);
+    }
 
     /// Every nine-bit pattern decodes through the table to the symbol and code
     /// length the trees give it.
