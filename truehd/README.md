@@ -14,7 +14,7 @@ A low-level parser and decoder for Dolby TrueHD audio bitstreams, implemented in
 truehd = "0.7.2"
 ```
 
-Requires Rust 1.88.0 or later.
+Requires Rust 1.89.0 or later.
 
 Decoding runs in three stages: an `Extractor` finds frames in a byte stream, a
 `Parser` turns each frame into an access unit, and a `Decoder` renders access

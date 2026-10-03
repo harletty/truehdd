@@ -357,7 +357,7 @@ pub struct DecoderState {
 
     /// Where the filters of a block keep their states while it is decoded. Nothing
     /// in it outlives the block.
-    recorrelator_states: Box<[LaneStates; STATE_BASE + 8]>,
+    recorrelator_states: Box<LaneStateBuffer>,
 }
 
 impl Default for DecoderState {
@@ -387,7 +387,7 @@ impl Default for DecoderState {
             zero_samples: 0,
             oamd: VecDeque::with_capacity(4),
             substream_info_changed: false,
-            recorrelator_states: Box::new([[[0; LANES]; 2]; STATE_BASE + 8]),
+            recorrelator_states: Box::new(LaneStateBuffer([[[0; MAX_LANES]; 2]; STATE_BASE + 8])),
         }
     }
 }
@@ -623,21 +623,23 @@ impl DecoderState {
                 }
             };
 
-            let lanes = lanes_available();
+            let kernel = Kernel::available();
+            let lanes = kernel.lanes();
             let mut chi = min_chan;
 
             while chi <= max_chan {
-                if lanes {
-                    let channels = (max_chan + 1 - chi).min(LANES);
-                    let mut filters = [Recorrelator::default(); LANES];
+                if lanes != 0 {
+                    let channels = (max_chan + 1 - chi).min(lanes);
+                    let mut filters = [Recorrelator::default(); MAX_LANES];
                     for (lane, lane_filter) in filters[..channels].iter_mut().enumerate() {
                         *lane_filter = filter(chi + lane);
                     }
 
                     if recorrelate_lanes(
+                        kernel,
                         &filters[..channels],
                         coeff_state,
-                        &mut self.recorrelator_states,
+                        &mut self.recorrelator_states.0,
                         block_data,
                         rows,
                         chi,
@@ -1083,33 +1085,80 @@ fn recorrelate_at<const FIR: usize, const IIR: usize>(
     Ok(())
 }
 
-/// How many channels [`recorrelate_lanes`] runs side by side.
-const LANES: usize = 4;
+/// The most channels [`recorrelate_lanes`] runs side by side, which is how many
+/// the widest kernel takes.
+const MAX_LANES: usize = 8;
 
-/// The states of both filters of every lane at one sample.
-type LaneStates = [[i64; LANES]; 2];
+/// The states of both filters of every lane at one sample. A kernel with fewer
+/// lanes than [`MAX_LANES`] uses the first of them.
+type LaneStates = [[i64; MAX_LANES]; 2];
 
-/// Whether [`recorrelate_lanes`] can run on this processor.
-fn lanes_available() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        std::arch::is_x86_feature_detected!("avx2")
+/// The states of a block's filters, newest first, below the eight a block
+/// started with. Aligned for the widest kernel's loads.
+#[repr(C, align(64))]
+#[derive(Debug)]
+struct LaneStateBuffer([LaneStates; STATE_BASE + 8]);
+
+/// The widest of the side-by-side kernels this processor runs.
+///
+/// `--cfg truehd_force_avx2` holds an AVX-512 processor to the AVX2 kernels,
+/// and `--cfg truehd_force_scalar` any processor to a channel and a product at
+/// a time, so that each path can be checked against the others on one machine.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+// The vector kernels are not built where the processor is not asked for them.
+#[cfg_attr(
+    any(not(target_arch = "x86_64"), truehd_force_scalar),
+    allow(dead_code)
+)]
+enum Kernel {
+    /// A channel at a time, and a product at a time.
+    Scalar,
+    /// AVX2: four channels or eight products at a time.
+    Avx2,
+    /// AVX-512: eight channels at a time.
+    Avx512,
+}
+
+impl Kernel {
+    fn available() -> Self {
+        #[cfg(all(target_arch = "x86_64", not(truehd_force_scalar)))]
+        {
+            if !cfg!(truehd_force_avx2)
+                && std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512vl")
+                && std::arch::is_x86_feature_detected!("avx512dq")
+            {
+                return Self::Avx512;
+            }
+            if std::arch::is_x86_feature_detected!("avx2") {
+                return Self::Avx2;
+            }
+        }
+
+        Self::Scalar
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
+
+    /// How many channels [`recorrelate_lanes`] runs side by side with this kernel:
+    /// none where it cannot.
+    fn lanes(self) -> usize {
+        match self {
+            Self::Scalar => 0,
+            Self::Avx2 => 4,
+            Self::Avx512 => 8,
+        }
     }
 }
 
-/// [`recorrelate`] for the channels `chi..chi + filters.len()`, at most [`LANES`]
-/// of them, side by side. `false` where the processor cannot, and where a state
-/// of any of them left its range: the rows are then not to be used, and the
-/// caller runs the channels one at a time, which reports the first.
+/// [`recorrelate`] for the channels `chi..chi + filters.len()`, at most as many
+/// as the kernel has lanes, side by side. `false` where the processor cannot,
+/// and where a state of any of them left its range: the rows are then not to be
+/// used, and the caller runs the channels one at a time, which reports the first.
 ///
 /// One channel alone is held to twelve multiplications a sample, one after the
 /// other. Side by side, each multiplication is one instruction for all the lanes.
-#[allow(unused_variables)]
+#[allow(unused_variables, clippy::too_many_arguments)]
 fn recorrelate_lanes(
+    kernel: Kernel,
     filters: &[Recorrelator],
     coeff_state: &mut [[[i32; 8]; 16]; 2],
     states: &mut [LaneStates; STATE_BASE + 8],
@@ -1118,31 +1167,41 @@ fn recorrelate_lanes(
     chi: usize,
     wide: bool,
 ) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") {
-        // SAFETY: the processor has AVX2, which is all the function requires.
-        return unsafe {
+    match kernel {
+        // SAFETY: the kernel is the one `Kernel::available` found the processor
+        // has, which is all the function requires.
+        #[cfg(target_arch = "x86_64")]
+        Kernel::Avx512 => unsafe {
+            avx512::recorrelate_lanes(filters, coeff_state, states, block_data, rows, chi, wide)
+        },
+        // SAFETY: as above.
+        #[cfg(target_arch = "x86_64")]
+        Kernel::Avx2 => unsafe {
             avx2::recorrelate_lanes(filters, coeff_state, states, block_data, rows, chi, wide)
-        };
+        },
+        #[cfg(not(target_arch = "x86_64"))]
+        Kernel::Avx512 | Kernel::Avx2 => false,
+        Kernel::Scalar => false,
     }
-
-    false
 }
 
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
-    use super::{LANES, LaneStates, Recorrelator, STATE_BASE};
+    use super::{LaneStates, MAX_LANES, Recorrelator, STATE_BASE};
     use std::arch::x86_64::*;
 
+    /// How many channels this kernel runs side by side.
+    const LANES: usize = 4;
+
     #[inline(always)]
-    fn load(lanes: &[i64; LANES]) -> __m256i {
-        // SAFETY: an array of four `i64` is 32 readable bytes.
+    fn load(lanes: &[i64; MAX_LANES]) -> __m256i {
+        // SAFETY: the first four of eight `i64` are 32 readable bytes.
         unsafe { _mm256_loadu_si256(lanes.as_ptr().cast()) }
     }
 
     #[inline(always)]
-    fn store(lanes: &mut [i64; LANES], value: __m256i) {
-        // SAFETY: an array of four `i64` is 32 writable bytes.
+    fn store(lanes: &mut [i64; MAX_LANES], value: __m256i) {
+        // SAFETY: the first four of eight `i64` are 32 writable bytes.
         unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast(), value) }
     }
 
@@ -1244,10 +1303,10 @@ mod avx2 {
             return false;
         }
 
-        let mut fir = [[0i64; LANES]; 8];
-        let mut iir = [[0i64; LANES]; 4];
-        let mut shift = [0i64; LANES];
-        let mut mask = [0i64; LANES];
+        let mut fir = [[0i64; MAX_LANES]; 8];
+        let mut iir = [[0i64; MAX_LANES]; 4];
+        let mut shift = [0i64; MAX_LANES];
+        let mut mask = [0i64; MAX_LANES];
         let mut live = [0i32; LANES];
 
         for (channel, filter) in (chi..).zip(filters) {
@@ -1266,7 +1325,7 @@ mod avx2 {
         }
 
         for (tap, states) in states[STATE_BASE..].iter_mut().enumerate() {
-            *states = [[0; LANES]; 2];
+            *states = [[0; MAX_LANES]; 2];
 
             for channel in chi..chi + filters.len() {
                 states[0][lane_of(channel)] = coeff_state[0][channel][tap] as i64;
@@ -1376,6 +1435,290 @@ mod avx2 {
             for channel in chi..chi + filters.len() {
                 coeff_state[0][channel][tap] = states[0][lane_of(channel)] as i32;
                 coeff_state[1][channel][tap] = states[1][lane_of(channel)] as i32;
+            }
+        }
+
+        true
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod avx512 {
+    use super::{LaneStates, MAX_LANES, Recorrelator, STATE_BASE};
+    use std::arch::x86_64::*;
+
+    /// How many channels this kernel runs side by side.
+    const LANES: usize = MAX_LANES;
+
+    #[inline(always)]
+    fn load(lanes: &[i64; LANES]) -> __m512i {
+        // SAFETY: an array of eight `i64` is 64 readable bytes.
+        unsafe { _mm512_loadu_si512(lanes.as_ptr().cast()) }
+    }
+
+    #[inline(always)]
+    fn store(lanes: &mut [i64; LANES], value: __m512i) {
+        // SAFETY: an array of eight `i64` is 64 writable bytes.
+        unsafe { _mm512_storeu_si512(lanes.as_mut_ptr().cast(), value) }
+    }
+
+    #[inline(always)]
+    fn load_eight(values: &[i32; 8]) -> __m256i {
+        // SAFETY: an array of eight `i32` is 32 readable bytes.
+        unsafe { _mm256_loadu_si256(values.as_ptr().cast()) }
+    }
+
+    #[inline(always)]
+    fn store_eight(values: &mut [i32; 8], value: __m256i) {
+        // SAFETY: an array of eight `i32` is 32 writable bytes.
+        unsafe { _mm256_storeu_si256(values.as_mut_ptr().cast(), value) }
+    }
+
+    /// Eight rows of eight 32-bit values as their eight columns: the taps of
+    /// eight channels as the channels of eight taps, and back again. The
+    /// states and coefficients of a block come a channel at a time, and the
+    /// lanes take them a tap at a time; through registers, where a vector
+    /// loaded over values just stored one at a time waits for the stores.
+    #[inline]
+    #[target_feature(enable = "avx2,avx512f,avx512vl,avx512dq")]
+    fn transpose(rows: [__m256i; 8]) -> [__m256i; 8] {
+        let pair = |a, b| _mm512_inserti64x4::<1>(_mm512_castsi256_si512(a), b);
+        let [r0, r1, r2, r3, r4, r5, r6, r7] = rows;
+        let (p01, p23) = (pair(r0, r1), pair(r2, r3));
+        let (p45, p67) = (pair(r4, r5), pair(r6, r7));
+
+        // Four rows' first four values, a column at a time, then their last four.
+        let lo = _mm512_setr_epi32(0, 8, 16, 24, 1, 9, 17, 25, 2, 10, 18, 26, 3, 11, 19, 27);
+        let hi = _mm512_add_epi32(lo, _mm512_set1_epi32(4));
+        let (a_lo, a_hi) = (
+            _mm512_permutex2var_epi32(p01, lo, p23),
+            _mm512_permutex2var_epi32(p01, hi, p23),
+        );
+        let (b_lo, b_hi) = (
+            _mm512_permutex2var_epi32(p45, lo, p67),
+            _mm512_permutex2var_epi32(p45, hi, p67),
+        );
+
+        // Two whole columns a register.
+        let lo = _mm512_setr_epi32(0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23);
+        let hi = _mm512_add_epi32(lo, _mm512_set1_epi32(8));
+        let halves = |v| [_mm512_castsi512_si256(v), _mm512_extracti64x4_epi64::<1>(v)];
+        let [c0, c1] = halves(_mm512_permutex2var_epi32(a_lo, lo, b_lo));
+        let [c2, c3] = halves(_mm512_permutex2var_epi32(a_lo, hi, b_lo));
+        let [c4, c5] = halves(_mm512_permutex2var_epi32(a_hi, lo, b_hi));
+        let [c6, c7] = halves(_mm512_permutex2var_epi32(a_hi, hi, b_hi));
+
+        [c0, c1, c2, c3, c4, c5, c6, c7]
+    }
+
+    /// See [`super::avx2::recorrelate_lanes`], for eight channels. The lanes
+    /// that are live are a mask here, the shifts are arithmetic ones, and a
+    /// sample waits less on the one before: of the two products a prediction
+    /// takes of the newest states, the second filter's is taken of the bits
+    /// the mask took off the prediction before, which are known two steps
+    /// before the state is, and the sum is formed in the order its terms are
+    /// ready.
+    #[target_feature(enable = "avx2,avx512f,avx512vl,avx512dq")]
+    pub(super) fn recorrelate_lanes(
+        filters: &[Recorrelator],
+        coeff_state: &mut [[[i32; 8]; 16]; 2],
+        states: &mut [LaneStates; STATE_BASE + 8],
+        block_data: &[[i32; 16]],
+        rows: &mut [[i32; 16]],
+        chi: usize,
+        wide: bool,
+    ) -> bool {
+        let block_size = block_data.len().min(rows.len()).min(STATE_BASE);
+        let first = chi.min(16 - LANES);
+        let lane_of = |channel: usize| channel - first;
+
+        if chi + filters.len() > first + LANES {
+            return false;
+        }
+
+        // The coefficients and the states the block starts with, a tap at a
+        // time, without the lanes that are not live: their coefficients are
+        // zero, so their states stay zero.
+        let zero = _mm256_setzero_si256();
+        let mut fir_rows = [zero; LANES];
+        let mut iir_rows = [zero; LANES];
+        let mut shift = zero;
+        let mut mask = zero;
+        let mut live: __mmask8 = 0;
+
+        for (channel, filter) in (chi..).zip(filters) {
+            let lane = lane_of(channel);
+
+            fir_rows[lane] = load_eight(&filter.fir);
+            // SAFETY: an array of four `i32` is 16 readable bytes.
+            iir_rows[lane] =
+                _mm256_zextsi128_si256(unsafe { _mm_loadu_si128(filter.iir.as_ptr().cast()) });
+            // As a scalar shift takes its count.
+            shift = _mm256_mask_set1_epi32(shift, 1 << lane, filter.shift & 63);
+            // The step size is a four-bit field, so the mask is the same in 32 bits.
+            mask = _mm256_mask_set1_epi32(mask, 1 << lane, filter.mask as i32);
+            live |= 1 << lane;
+        }
+
+        let widen = |column| _mm512_cvtepi32_epi64(column);
+        let fir = transpose(fir_rows).map(widen);
+        let iir_columns = transpose(iir_rows);
+        let iir: [__m512i; 4] = core::array::from_fn(|tap| widen(iir_columns[tap]));
+        let shift = _mm512_cvtepi32_epi64(shift);
+        let mask = _mm512_cvtepi32_epi64(mask);
+
+        for (filter, coeff_state) in coeff_state.iter().enumerate() {
+            let rows: [__m256i; LANES] =
+                core::array::from_fn(|lane| load_eight(&coeff_state[first + lane]));
+
+            for (tap, column) in transpose(rows).into_iter().enumerate() {
+                store(
+                    &mut states[STATE_BASE + tap][filter],
+                    _mm512_maskz_cvtepi32_epi64(live, column),
+                );
+            }
+        }
+
+        // A state in range, moved up by half the range, has no bit at or above
+        // the width of the range.
+        let (bias, bits) = if wide {
+            (1i64 << 31, 32)
+        } else {
+            (1i64 << 23, 24)
+        };
+        let bias = _mm512_set1_epi64(bias);
+        let above_range = _mm512_set1_epi64(-1i64 << bits);
+        // The products of the older states, over a window of states newest
+        // first: taps 2 to 7 of the first filter, 2 and 3 of the second. The
+        // two newest states are kept in registers, and their products taken
+        // apart.
+        let older_products = |window: &[LaneStates]| -> __m512i {
+            let window: &[LaneStates; 8] = window[..8].try_into().expect("eight states");
+            let mut acc = _mm512_setzero_si512();
+
+            for tap in (2..8).rev() {
+                acc = _mm512_add_epi64(acc, _mm512_mul_epi32(fir[tap], load(&window[tap][0])));
+            }
+            for tap in (2..4).rev() {
+                acc = _mm512_add_epi64(acc, _mm512_mul_epi32(iir[tap], load(&window[tap][1])));
+            }
+
+            acc
+        };
+
+        // The prediction of the first sample, from the states the block starts
+        // with: every tap of both filters.
+        let history = &states[STATE_BASE];
+        let mut newest_fir = load(&history[0]);
+        let mut newest_iir = load(&history[1]);
+        let mut pred = _mm512_srav_epi64(
+            _mm512_add_epi64(
+                _mm512_add_epi64(
+                    older_products(&states[STATE_BASE..]),
+                    _mm512_add_epi64(
+                        _mm512_mul_epi32(fir[1], load(&states[STATE_BASE + 1][0])),
+                        _mm512_mul_epi32(iir[1], load(&states[STATE_BASE + 1][1])),
+                    ),
+                ),
+                _mm512_add_epi64(
+                    _mm512_mul_epi32(fir[0], newest_fir),
+                    _mm512_mul_epi32(iir[0], newest_iir),
+                ),
+            ),
+            shift,
+        );
+        let mut out_of_range = _mm512_setzero_si512();
+
+        for blki in 0..block_size {
+            let state_base = STATE_BASE - blki;
+            let data: &[i32; LANES] = block_data[blki][first..first + LANES]
+                .try_into()
+                .expect("eight channels");
+            let row: &mut [i32; LANES] = (&mut rows[blki][first..first + LANES])
+                .try_into()
+                .expect("eight channels");
+
+            // SAFETY: an array of eight `i32` is 32 readable bytes.
+            let residual = _mm512_maskz_cvtepi32_epi64(live, unsafe {
+                _mm256_loadu_si256(data.as_ptr().cast())
+            });
+            // All that the next prediction takes from before this sample: the
+            // products of the states but the two newest, and the second
+            // filter's first product's share of the residual, that filter's
+            // newest state being the residual less a part of the prediction.
+            // None of it waits on the prediction.
+            let older = _mm512_add_epi64(
+                older_products(&states[state_base - 1..]),
+                _mm512_mul_epi32(iir[0], residual),
+            );
+            let newest = _mm512_add_epi64(
+                _mm512_mul_epi32(fir[1], newest_fir),
+                _mm512_mul_epi32(iir[1], newest_iir),
+            );
+
+            // The bits the mask keeps go to the first filter's state, those it
+            // takes off come off the second's: the latter are below 2^15, the
+            // step size being a four-bit field, so their product is exact in
+            // 32 bits, and ready before the first state's product is.
+            let kept = _mm512_and_si512(pred, mask);
+            let dropped = _mm512_andnot_si512(mask, pred);
+            let fir_state = _mm512_add_epi64(residual, kept);
+            let iir_state = _mm512_sub_epi64(residual, dropped);
+            let fir_product = _mm512_mul_epi32(fir[0], fir_state);
+            let iir_product = _mm512_mul_epi32(iir[0], dropped);
+
+            // The three or-ed together: 0xFE is the truth table of `a | b | c`.
+            out_of_range = _mm512_ternarylogic_epi64::<0xFE>(
+                out_of_range,
+                _mm512_add_epi64(fir_state, bias),
+                _mm512_add_epi64(iir_state, bias),
+            );
+
+            store(&mut states[state_base - 1][0], fir_state);
+            store(&mut states[state_base - 1][1], iir_state);
+
+            // SAFETY: an array of eight `i32` is 32 writable bytes, of which the
+            // mask selects.
+            unsafe {
+                _mm256_mask_storeu_epi32(row.as_mut_ptr(), live, _mm512_cvtepi64_epi32(fir_state));
+            }
+
+            // The sum, in the order the terms are ready: the compiler is free
+            // to reassociate a sum, and puts the term that waits on the
+            // prediction first, where every other term then waits on it.
+            let acc: __m512i;
+            // SAFETY: three register-to-register additions, with no memory or
+            // flags touched.
+            unsafe {
+                std::arch::asm!(
+                    "vpaddq {acc}, {newest}, {older}",
+                    "vpsubq {acc}, {acc}, {iir_product}",
+                    "vpaddq {acc}, {acc}, {fir_product}",
+                    newest = in(zmm_reg) newest,
+                    older = in(zmm_reg) older,
+                    iir_product = in(zmm_reg) iir_product,
+                    fir_product = in(zmm_reg) fir_product,
+                    acc = out(zmm_reg) acc,
+                    options(pure, nomem, nostack, preserves_flags),
+                );
+            }
+            pred = _mm512_srav_epi64(acc, shift);
+            newest_fir = fir_state;
+            newest_iir = iir_state;
+        }
+
+        if _mm512_test_epi64_mask(out_of_range, above_range) != 0 {
+            return false;
+        }
+
+        for (filter, coeff_state) in coeff_state.iter_mut().enumerate() {
+            let columns: [__m256i; 8] = core::array::from_fn(|tap| {
+                _mm512_cvtepi64_epi32(load(&states[STATE_BASE - block_size + tap][filter]))
+            });
+            let rows = transpose(columns);
+
+            for channel in chi..chi + filters.len() {
+                store_eight(&mut coeff_state[channel], rows[lane_of(channel)]);
             }
         }
 
@@ -1514,10 +1857,11 @@ fn apply_steady_matrix(
     dither: Option<Dither<'_>>,
 ) {
     #[cfg(target_arch = "x86_64")]
-    if terms.count >= WHOLE_ROW_TERMS && std::arch::is_x86_feature_detected!("avx2") {
+    if terms.count >= WHOLE_ROW_TERMS && Kernel::available() != Kernel::Scalar {
         let (coeff, upper) = terms.by_channel();
 
-        // SAFETY: the processor has AVX2, which is all the function requires.
+        // SAFETY: the processor has AVX2, which is all the function requires,
+        // the wider kernel being an extension of it.
         unsafe {
             match (dither, upper) {
                 (Some(dither), false) => avx2::apply_matrix::<false>(
@@ -1747,13 +2091,20 @@ mod tests {
     }
 
     /// The lanes leave the rows and the filter states that one channel at a time
-    /// leaves, and refuse the blocks in which a state leaves its range.
+    /// leaves, and refuse the blocks in which a state leaves its range: every
+    /// kernel the processor has, not only the widest.
     #[test]
     fn lanes_match_one_channel_at_a_time() {
-        if !lanes_available() {
-            return;
-        }
+        let widest = Kernel::available();
+        let kernels = [Kernel::Avx2, Kernel::Avx512];
 
+        for kernel in kernels.into_iter().filter(|&kernel| kernel <= widest) {
+            lanes_match_one_channel_at_a_time_with(kernel);
+        }
+    }
+
+    fn lanes_match_one_channel_at_a_time_with(kernel: Kernel) {
+        let lanes = kernel.lanes();
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut random = |bits: u32| {
             seed ^= seed << 13;
@@ -1761,13 +2112,13 @@ mod tests {
             seed ^= seed << 17;
             (seed as i64 >> (64 - bits)) as i32
         };
-        let mut states = Box::new([[[0; LANES]; 2]; STATE_BASE + 8]);
+        let mut states = Box::new(LaneStateBuffer([[[0; MAX_LANES]; 2]; STATE_BASE + 8]));
         let (mut in_range, mut out_of_range) = (0, 0);
 
         for round in 0..400usize {
             let wide = round % 5 == 0;
-            let channels = 1 + round % LANES;
-            let chi = [0, 3, 12, 16 - channels][round / LANES % 4];
+            let channels = 1 + round % lanes;
+            let chi = [0, 3, 16 - lanes, 16 - channels][round / lanes % 4];
             let block_size = 8 + (random(16) as usize & 0xFFFF) % 153;
             // Mostly residuals a stable filter keeps in range, sometimes not.
             let residual_bits = if round % 7 == 0 { 24 } else { 16 };
@@ -1813,19 +2164,20 @@ mod tests {
             let mut lane_state = coeff_state;
             let mut lane_rows = vec![[0x5a5a5a5a; 16]; block_size];
             let side_by_side = recorrelate_lanes(
+                kernel,
                 &filters,
                 &mut lane_state,
-                &mut states,
+                &mut states.0,
                 &block_data,
                 &mut lane_rows,
                 chi,
                 wide,
             );
 
-            assert_eq!(side_by_side, one_at_a_time, "round {round}");
+            assert_eq!(side_by_side, one_at_a_time, "{kernel:?} round {round}");
             if side_by_side {
-                assert_eq!(lane_rows, one_rows, "round {round}");
-                assert_eq!(lane_state, one_state, "round {round}");
+                assert_eq!(lane_rows, one_rows, "{kernel:?} round {round}");
+                assert_eq!(lane_state, one_state, "{kernel:?} round {round}");
                 in_range += 1;
             } else {
                 out_of_range += 1;
@@ -1834,7 +2186,7 @@ mod tests {
 
         assert!(
             in_range > 100 && out_of_range > 10,
-            "{in_range} {out_of_range}"
+            "{kernel:?}: {in_range} {out_of_range}"
         );
     }
 }

@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Extractor` copies an access unit once into the `Frame` it returns, instead of into a 64 KiB vector first and from there into the frame
 - On x86-64 processors with AVX2, a lossless matrix of five coefficients or more is applied eight channels to a multiplication. Decoding takes 1 to 5% less time, and 3 to 12% less for the presentation that has an object substream
 - Where the prediction filters run one channel at a time, which is on every processor but an x86-64 one with AVX2, each runs with the coefficients it has instead of twelve. Decoding takes 4 to 12% less time there
+- On x86-64 processors with AVX-512, the prediction filters of eight channels run side by side, with a shorter wait from one sample to the next. Decoding takes 3 to 11% less time there, most for a stream whose substreams carry six or eight channels. The crate now requires Rust 1.89
 - **BREAKING**: `structs::oamd` re-exports the [`oamd`](https://crates.io/crates/oamd) crate, which now owns these structures. Every type and function keeps the path it had, but `TEST_DATA` is `EXAMPLE_DATA` there and the other test payloads are no longer public
 
 ### Fixed

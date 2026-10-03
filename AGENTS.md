@@ -13,8 +13,8 @@ separate [`oamd`](https://github.com/truehdd/oamd) crate.
 
 Each of the three has its own changelog and its own version line, and is released on its own.
 
-MSRV is 1.88 for the library and the macros and 1.95 for the CLI, checked with
-`cargo +1.88 check -p truehd -p truehdd-macros` and `cargo +1.95 check`. Never nightly.
+MSRV is 1.89 for the library, 1.88 for the macros and 1.95 for the CLI, checked with
+`cargo +1.89 check -p truehd`, `cargo +1.88 check -p truehdd-macros` and `cargo +1.95 check`. Never nightly.
 
 ## Before you open a pull request
 
