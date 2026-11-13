@@ -170,6 +170,7 @@ fn decoding_into_a_kept_result_matches_a_new_one() {
                 );
                 assert_eq!(kept.is_duplicate, new.is_duplicate, "{at}");
                 assert_eq!(kept.overlaps_previous, new.overlaps_previous, "{at}");
+                assert_eq!(kept.gap_before, new.gap_before, "{at}");
                 assert_eq!(
                     kept.substream_info_changed, new.substream_info_changed,
                     "{at}"

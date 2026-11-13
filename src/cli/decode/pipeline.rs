@@ -517,6 +517,7 @@ fn silence_like(decoded: &DecodedAccessUnit) -> DecodedAccessUnit {
         oamd: Vec::new(),
         is_duplicate: false,
         overlaps_previous: false,
+        gap_before: 0,
         substream_info_changed: false,
     }
 }

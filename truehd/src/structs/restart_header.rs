@@ -648,6 +648,19 @@ impl RestartHeader {
             state.has_duplicate_timing = true;
         }
 
+        // The previous access unit ends one access unit after its own output time;
+        // a restart header dated a little past that leaves a hole in the timeline.
+        if valid && state.gap_before == 0 {
+            let ends = state
+                .substream_state()?
+                .output_timing
+                .wrapping_add(state.samples_per_au as u16);
+            let gap = self.output_timing.wrapping_sub(ends) as usize;
+            if gap != 0 && gap <= samples_per_75ms(state.sampling_frequency) as usize {
+                state.gap_before = gap;
+            }
+        }
+
         state.reset_decoder_substream_state();
 
         let ss_state = state.substream_state_mut()?;

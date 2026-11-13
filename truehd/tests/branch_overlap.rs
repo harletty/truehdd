@@ -1,5 +1,6 @@
-//! `DecodedAccessUnit::overlaps_previous`: an access unit whose restart header
-//! dates it at the output time of the access unit before it.
+//! `DecodedAccessUnit::overlaps_previous` and `gap_before`: an access unit whose
+//! restart header dates it at the output time of the access unit before it, or a
+//! short way past the end of it.
 //!
 //! Blu-ray titles that branch between clips end each clip's stream one access
 //! unit past the splice, and the next clip's first access unit restates that
@@ -9,6 +10,9 @@
 //! flag reports, with samples that match bit for bit (so `is_duplicate` holds
 //! too). What the flag adds over `is_duplicate`, an overlap whose samples
 //! differ, is not built here: it takes two encodes of the same time.
+//!
+//! The gap is what a remux leaves where it drops an access unit that was not an
+//! overlap: built here by leaving out the access unit ahead of a major sync.
 
 use truehd::process::decode::{DecodedAccessUnit, Decoder};
 use truehd::process::extract::Extractor;
@@ -49,8 +53,22 @@ fn is_major_sync(unit: &[u8]) -> bool {
     unit[4..8] == MAJOR_SYNC_FBA
 }
 
-/// Each access unit's flags, decoded through the kept-result path.
-fn decode(data: &[u8], presentation: usize) -> Vec<(bool, bool)> {
+/// What the decoder said of one access unit's timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Timing {
+    overlaps: bool,
+    duplicate: bool,
+    gap: usize,
+}
+
+const ON_TIME: Timing = Timing {
+    overlaps: false,
+    duplicate: false,
+    gap: 0,
+};
+
+/// Each access unit's timing, decoded through the kept-result path.
+fn decode(data: &[u8], presentation: usize) -> Vec<Timing> {
     let mut extractor = Extractor::default();
     extractor.push_bytes(data);
     let mut parser = Parser::default();
@@ -66,7 +84,11 @@ fn decode(data: &[u8], presentation: usize) -> Vec<(bool, bool)> {
         decoder
             .decode_presentation_into(&access_unit, presentation, &mut decoded)
             .expect("the stream decodes");
-        flags.push((decoded.overlaps_previous, decoded.is_duplicate));
+        flags.push(Timing {
+            overlaps: decoded.overlaps_previous,
+            duplicate: decoded.is_duplicate,
+            gap: decoded.gap_before,
+        });
     }
     flags
 }
@@ -90,28 +112,64 @@ fn a_major_sync_sent_twice_overlaps_the_access_unit_before_it() {
     let flags = decode(&stream, 1);
     let copy = second_sync + 1;
     assert!(flags.len() > copy + 1, "the decode runs past the copy");
-    for (index, &(overlaps, duplicate)) in flags.iter().enumerate() {
+    for (index, &timing) in flags.iter().enumerate() {
         if index == copy {
-            assert!(overlaps, "the copy restates the output time before it");
-            assert!(duplicate, "and decodes to the same samples");
+            // It restates the output time before it, and decodes to the same samples.
+            let copy = Timing {
+                overlaps: true,
+                duplicate: true,
+                gap: 0,
+            };
+            assert_eq!(timing, copy, "the copy");
         } else {
-            assert!(!overlaps, "access unit {index} follows on in time");
-            assert!(!duplicate, "access unit {index} is no duplicate");
+            assert_eq!(timing, ON_TIME, "access unit {index}");
         }
     }
 }
 
 #[test]
-fn a_stream_that_follows_on_overlaps_nothing() {
-    for (index, (overlaps, duplicate)) in decode(FBA_2CH_SLICE, 1).into_iter().enumerate() {
-        assert!(!overlaps && !duplicate, "access unit {index}");
+fn an_access_unit_left_out_ahead_of_a_major_sync_leaves_a_gap() {
+    let units = access_units(FBA_2CH_SLICE);
+    let second_sync = (1..units.len())
+        .find(|&i| is_major_sync(units[i]))
+        .expect("the slice holds a second major sync");
+
+    // ..., unit[second_sync - 2], unit[second_sync], ...: one access unit left out.
+    let mut stream = Vec::new();
+    for unit in units[..second_sync - 1].iter().chain(&units[second_sync..]) {
+        stream.extend_from_slice(unit);
+    }
+
+    let flags = decode(&stream, 1);
+    let after_gap = second_sync - 1;
+    assert!(flags.len() > after_gap + 1, "the decode runs past the gap");
+    for (index, &timing) in flags.iter().enumerate() {
+        if index == after_gap {
+            // The major sync is dated one access unit (40 samples at 48 kHz) past
+            // the end of the access unit before it.
+            let gap = Timing {
+                overlaps: false,
+                duplicate: false,
+                gap: 40,
+            };
+            assert_eq!(timing, gap, "the access unit after the gap");
+        } else {
+            assert_eq!(timing, ON_TIME, "access unit {index}");
+        }
+    }
+}
+
+#[test]
+fn a_stream_that_follows_on_overlaps_nothing_and_misses_nothing() {
+    for (index, timing) in decode(FBA_2CH_SLICE, 1).into_iter().enumerate() {
+        assert_eq!(timing, ON_TIME, "access unit {index}");
     }
 }
 
 /// A splice whose next stream starts its output timing over somewhere else is
-/// a jump in time, not an overlap of one access unit.
+/// a jump in time, neither an overlap of one access unit nor a short gap.
 #[test]
-fn a_splice_that_restarts_its_timing_overlaps_nothing() {
+fn a_splice_that_restarts_its_timing_overlaps_nothing_and_misses_nothing() {
     let mut extractor = Extractor::default();
     extractor.push_bytes(FBA_SPLICED);
     let mut parser = Parser::default();
@@ -131,6 +189,7 @@ fn a_splice_that_restarts_its_timing_overlaps_nothing() {
             break;
         }
         assert!(!decoded.overlaps_previous, "access unit {index}");
+        assert_eq!(decoded.gap_before, 0, "access unit {index}");
         units += 1;
     }
     assert!(units > 344, "the decode runs past both splices");

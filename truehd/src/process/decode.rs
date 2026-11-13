@@ -212,6 +212,17 @@ pub struct DecodedAccessUnit {
     /// match the previous access unit's bit for bit, and implies this flag.
     pub overlaps_previous: bool,
 
+    /// Samples the stream's timeline is missing ahead of this access unit.
+    ///
+    /// Non-zero when its restart header states an output time a short way past
+    /// the end of the previous access unit: at most 75 ms, beyond which the jump
+    /// reads as another timeline rather than missing time. It is what a remux
+    /// leaves where it dropped an access unit at a seamless branch that was not
+    /// an overlap. A player that writes this many samples of silence ahead of
+    /// the access unit stays on the stream's timeline; one that does not runs
+    /// that much early from here on.
+    pub gap_before: usize,
+
     /// Indicates whether this access unit triggered a substream info change.
     ///
     /// This is `true` when substream_info or extended_substream_info changed,
@@ -231,6 +242,7 @@ impl Default for DecodedAccessUnit {
             oamd: vec![],
             is_duplicate: false,
             overlaps_previous: false,
+            gap_before: 0,
             substream_info_changed: false,
         }
     }
@@ -349,6 +361,10 @@ pub struct DecoderState {
     pub has_invalid_branch: bool,
     pub has_duplicate_timing: bool,
     pub has_duplicate_sample: bool,
+    /// Samples between the end of the previous access unit and the output time the
+    /// restart header of this one states, when that is a short step forward. See
+    /// [`DecodedAccessUnit::gap_before`].
+    pub gap_before: usize,
 
     pub sampling_frequency: u32,
     pub samples_per_au: usize,
@@ -388,6 +404,7 @@ impl Default for DecoderState {
             has_invalid_branch: false,
             has_duplicate_timing: false,
             has_duplicate_sample: false,
+            gap_before: 0,
             sampling_frequency: 0,
             samples_per_au: 0,
             presentation_map: None,
@@ -460,6 +477,7 @@ impl DecoderState {
 
         self.has_duplicate_timing = false;
         self.has_duplicate_sample = false;
+        self.gap_before = 0;
         self.oamd.clear();
 
         if let Some(extra_data) = &access_unit.extra_data
@@ -957,6 +975,7 @@ impl DecoderState {
             },
             is_duplicate: self.has_duplicate_timing && self.has_duplicate_sample,
             overlaps_previous: self.has_duplicate_timing,
+            gap_before: self.gap_before,
             substream_info_changed,
         };
 
@@ -985,6 +1004,7 @@ impl DecoderState {
         }
         decoded.is_duplicate = self.has_duplicate_timing && self.has_duplicate_sample;
         decoded.overlaps_previous = self.has_duplicate_timing;
+        decoded.gap_before = self.gap_before;
         decoded.substream_info_changed = substream_info_changed;
     }
 }
