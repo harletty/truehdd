@@ -516,6 +516,7 @@ fn silence_like(decoded: &DecodedAccessUnit) -> DecodedAccessUnit {
         channel_labels: decoded.channel_labels.clone(),
         oamd: Vec::new(),
         is_duplicate: false,
+        overlaps_previous: false,
         substream_info_changed: false,
     }
 }

@@ -195,6 +195,23 @@ pub struct DecodedAccessUnit {
     /// Downstream applications may safely discard this frame.
     pub is_duplicate: bool,
 
+    /// Indicates whether the stream dates this access unit at the output time
+    /// of the previous one.
+    ///
+    /// This is `true` when its restart header states the same output timing as
+    /// the access unit before it. That happens at a seamless branch whose
+    /// outgoing stream runs one access unit past the splice, as on Blu-ray
+    /// titles that branch between clips: the last access unit of one clip and
+    /// the first of the next cover the same 40 samples. A player that keeps
+    /// both plays them twice and falls one access unit behind the stream's own
+    /// timeline at every such splice. Its samples are a second rendering of
+    /// time already decoded, so they can be discarded; its metadata belongs to
+    /// that time and should be kept.
+    ///
+    /// [`is_duplicate`](Self::is_duplicate) is the case where the samples also
+    /// match the previous access unit's bit for bit, and implies this flag.
+    pub overlaps_previous: bool,
+
     /// Indicates whether this access unit triggered a substream info change.
     ///
     /// This is `true` when substream_info or extended_substream_info changed,
@@ -213,6 +230,7 @@ impl Default for DecodedAccessUnit {
             channel_labels: vec![],
             oamd: vec![],
             is_duplicate: false,
+            overlaps_previous: false,
             substream_info_changed: false,
         }
     }
@@ -938,6 +956,7 @@ impl DecoderState {
                 vec![]
             },
             is_duplicate: self.has_duplicate_timing && self.has_duplicate_sample,
+            overlaps_previous: self.has_duplicate_timing,
             substream_info_changed,
         };
 
@@ -965,6 +984,7 @@ impl DecoderState {
             decoded.oamd.extend(self.oamd.iter().cloned());
         }
         decoded.is_duplicate = self.has_duplicate_timing && self.has_duplicate_sample;
+        decoded.overlaps_previous = self.has_duplicate_timing;
         decoded.substream_info_changed = substream_info_changed;
     }
 }
